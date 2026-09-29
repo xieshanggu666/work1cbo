@@ -42,7 +42,7 @@ function emptySchedulingStats() {
   return {
     day: 1, todayScheduled: 0, onDuty: 0, absentToday: 0, lateToday: 0,
     overtimeHoursToday: 0, settledToday: 0, payToday: 0, pendingRequests: 0,
-    coverageWarnings: 0, coverageBlocks: 0
+    reservationForecast: 0, coverageWarnings: 0, coverageBlocks: 0, upcomingWarnings: 0
   }
 }
 
@@ -89,7 +89,8 @@ export const useParkStore = defineStore('park', {
     attendance: s => s.data?.attendance || [],
     shiftRequests: s => s.data?.shiftRequests || [],
     schedulingStats: s => s.data?.schedulingStats || emptySchedulingStats(),
-    coverageToday: s => s.data?.coverageToday || { warnings: [], rosterCount: 0 },
+    coverageToday: s => s.data?.coverageToday || { warnings: [], rosterCount: 0, signals: { entryByHour: {}, dayTotal: 0 } },
+    coverageByDay: s => s.data?.coverageByDay || {},
     supervisors: s => (s.data?.staff || []).filter(x => x.role === '运营主管')
   },
   actions: {

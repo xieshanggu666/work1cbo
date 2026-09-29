@@ -495,6 +495,12 @@ ensureColumn('reservations', 'member_id', "member_id INTEGER")
 ensureColumn('reservations', 'benefit_id', "benefit_id INTEGER")
 // 投诉联动：会员本人投诉，可积分补偿结案
 ensureColumn('complaints', 'member_id', "member_id INTEGER")
+// 动态调度留痕：排班来源、需求类型/引用、需求评分与实际服务区域（跨区支援时可不同于员工所属区域）
+ensureColumn('staff_schedules', 'source', "source TEXT NOT NULL DEFAULT 'manual'")
+ensureColumn('staff_schedules', 'demand_type', "demand_type TEXT NOT NULL DEFAULT ''")
+ensureColumn('staff_schedules', 'demand_ref', "demand_ref TEXT NOT NULL DEFAULT ''")
+ensureColumn('staff_schedules', 'demand_score', "demand_score REAL NOT NULL DEFAULT 0")
+ensureColumn('staff_schedules', 'zone_id', "zone_id INTEGER")
 
 // ---------- 事务 ----------
 // 多步写入（库存/订单/现金/流水/日志）必须原子提交：任一步失败整体回滚，不留半完成状态。

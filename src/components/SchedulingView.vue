@@ -26,6 +26,10 @@ const schedMap = computed(() => {
   for (const s of store.schedules) {
     if (!m.has(s.day)) m.set(s.day, new Map())
     m.get(s.day).set(s.staff_id, s)
+    if (s.board_day && s.board_day !== s.day && !m.get(s.board_day)?.has(s.staff_id)) {
+      if (!m.has(s.board_day)) m.set(s.board_day, new Map())
+      m.get(s.board_day).set(s.staff_id, { ...s, _cross_day_board: true })
+    }
   }
   return m
 })
@@ -121,7 +125,12 @@ const reqStatusMeta = st => ({
 }[st] || { label: st, cls: '' })
 
 const approverId = computed(() => store.supervisors[0]?.id || null)
-async function approve(r) { await store.approveShiftRequest(r.id, approverId.value) }
+async function approve(r) {
+  const out = await store.approveShiftRequest(r.id, approverId.value)
+  if (out?.ok && out.warnings?.length) {
+    alert(`调班已批准，但产生 ${out.warnings.length} 条覆盖预警，请查看「岗位覆盖」`)
+  }
+}
 async function reject(r) {
   const note = prompt('驳回原因（可选）：', '')
   if (note === null) return
@@ -131,7 +140,23 @@ async function withdraw(r) { await store.cancelShiftRequest(r.id, r.staff_id) }
 
 // ---- 岗位覆盖 ----
 const coverage = computed(() => store.coverageToday)
-const warnIcon = lv => lv === 'block' ? '⛔' : '⚠️'
+const coverageDay = ref(0)
+const coverageData = computed(() => store.coverageByDay[coverageDay.value] || coverage.value)
+const forecastTotal = computed(() => coverageData.value.signals?.dayTotal || 0)
+const activeCoverage = computed(() => coverageData.value.warnings.filter(w => w.status === 'active'))
+const upcomingCoverage = computed(() => coverageData.value.warnings.filter(w => w.status !== 'active'))
+function selectCoverageDay(d) { coverageDay.value = d }
+const warnIcon = lv => lv === 'block' ? '⛔' : lv === 'info' ? '🕘' : '⚠️'
+const demandMeta = {
+  baseline: { label: '基础覆盖', cls: 'baseline' },
+  traffic: { label: '预约客流', cls: 'traffic' },
+  maintenance: { label: '检修工单', cls: 'maintenance' },
+  complaint: { label: '投诉岗位', cls: 'complaint' },
+  night: { label: '跨日夜班', cls: 'night' }
+}
+function demandTag(s) {
+  return demandMeta[s.demand_type]?.label || (s.source === 'swap' ? '调班接替' : s.source === 'auto' ? '动态补位' : '人工排班')
+}
 
 // 排班状态徽标
 function schedState(s) {
@@ -186,10 +211,11 @@ async function toggleAutoFill(v) {
       <div class="card stat"><span>👷</span><b class="on">{{ stats.onDuty }}</b><em>当前在岗</em></div>
       <div class="card stat" :class="{ alert: stats.absentToday }"><span>❌</span><b :class="stats.absentToday ? 'neg' : ''">{{ stats.absentToday }}</b><em>今日旷工</em></div>
       <div class="card stat"><span>⏰</span><b>{{ stats.lateToday }}</b><em>今日迟到</em></div>
+      <div class="card stat"><span>📈</span><b>{{ stats.reservationForecast || 0 }}</b><em>预约客流预测</em></div>
       <div class="card stat"><span>🕑</span><b>{{ stats.overtimeHoursToday }}h</b><em>今日加班</em></div>
       <div class="card stat"><span>💰</span><b class="money neg">¥{{ (stats.payToday || 0).toLocaleString() }}</b><em>今日工时工资</em></div>
       <div class="card stat" :class="{ alert: stats.pendingRequests }"><span>📝</span><b>{{ stats.pendingRequests }}</b><em>待审批申请</em></div>
-      <div class="card stat" :class="{ alert: stats.coverageWarnings }"><span>⚠️</span><b>{{ stats.coverageWarnings }}</b><em>覆盖预警</em></div>
+      <div class="card stat" :class="{ alert: stats.coverageWarnings || stats.upcomingWarnings }"><span>⚠️</span><b>{{ stats.coverageWarnings }}/{{ stats.upcomingWarnings || 0 }}</b><em>当前/即将缺岗</em></div>
     </div>
 
     <div class="tabs card-tabs">
@@ -199,7 +225,7 @@ async function toggleAutoFill(v) {
       </button>
       <label class="autofill" v-if="tab === 'board'">
         <input type="checkbox" v-model="autoFill" @change="toggleAutoFill($event.target.checked)" />
-        自动排班（未来 3 天，引擎每小时补齐）
+        动态自动补位（预约/检修/投诉驱动 · 未来 3 天）
       </label>
     </div>
 
@@ -231,6 +257,8 @@ async function toggleAutoFill(v) {
                 </div>
                 <div class="sc-time muted">{{ schedOf(st.id, d).time_text }}</div>
                 <div class="sc-tags">
+                  <em class="demand" :class="schedOf(st.id, d).demand_type || schedOf(st.id, d).source">{{ demandTag(schedOf(st.id, d)) }}</em>
+                  <em v-if="schedOf(st.id, d).cross_day">跨日</em>
                   <em v-if="schedOf(st.id, d).late">迟到</em>
                   <em v-if="schedOf(st.id, d).ot_approved">加班{{ schedOf(st.id, d).overtime_ticks }}h</em>
                   <em v-if="schedOf(st.id, d).work_ticks">出勤{{ schedOf(st.id, d).work_ticks }}h</em>
@@ -303,7 +331,7 @@ async function toggleAutoFill(v) {
           <button class="primary" @click="submitSchedule">排入班次</button>
           <em class="mmsg" :class="{ bad: formMsg.includes('失败') || formMsg.includes('冲突') || formMsg.includes('不能') }">{{ formMsg }}</em>
         </div>
-        <p class="muted tips">说明：同一员工同日仅允许一个有效排班（冲突拦截）；跨日夜班当日 17:00 上班、次日 09:00 下班并结算。排班会同步校验检修工单与待处置投诉的岗位覆盖。</p>
+        <p class="muted tips">说明：同一员工同日仅允许一个有效排班（冲突拦截）；自动补位只在出现预约客流、检修工单、投诉或夜间值守需求时生成排班，并在排班单上标注需求来源。跨日夜班当日 17:00 上班、次日 09:00 下班并结算，看板次日仍会展示在岗状态。</p>
       </div>
     </template>
 
@@ -385,13 +413,34 @@ async function toggleAutoFill(v) {
     <!-- ============ 岗位覆盖 ============ -->
     <template v-else>
       <div class="card coverage">
-        <h3>🛡️ 今日岗位覆盖校验（第 {{ today }} 天 · 在岗花名册 {{ coverage.rosterCount }} 人）</h3>
-        <div v-if="!coverage.warnings.length" class="ok-box">✅ 各开放区域、在途检修工单与待处置投诉的岗位覆盖齐全。</div>
-        <div v-for="(w, i) in coverage.warnings" :key="i" class="warn-item" :class="w.level">
-          <b>{{ warnIcon(w.level) }} {{ w.msg }}</b>
-          <span class="tag">{{ w.type === 'maintenance' ? '设施检修' : w.type.startsWith('zone') ? '区域岗位' : '投诉处置' }}</span>
+        <div class="coverage-head">
+          <h3>🛡️ 动态调度覆盖（第 {{ coverageDay || today }} 天 · 有效花名册 {{ coverageData.rosterCount }} 人）</h3>
+          <div class="day-pills">
+            <button v-for="d in days" :key="d" :class="{ on: (coverageDay || today) === d }" @click="selectCoverageDay(d)">{{ dayNames(d) }}</button>
+          </div>
         </div>
-        <p class="muted tips">覆盖规则：每个开放区域需有保安/安保与保洁当班；在途检修工单（尤其检修中）需有维修工；待处置投诉需有岗位匹配员工。缺口仅预警不强制（可加班/调班补齐）；真正的同日重复排班为硬冲突，在排班与调班审批时拦截。</p>
+        <div class="signal-bar">
+          <span>📈 预约入园预测 <b>{{ forecastTotal }}</b> 人</span>
+          <span>⛔ 当前阻断 <b>{{ activeCoverage.filter(w => w.level === 'block').length }}</b></span>
+          <span>⚠️ 当前缺口 <b>{{ activeCoverage.length }}</b></span>
+          <span>🕘 即将缺口 <b>{{ upcomingCoverage.length }}</b></span>
+        </div>
+        <div v-if="!coverageData.warnings.length" class="ok-box">✅ 预约客流、在途检修工单、待处置投诉与跨日夜班的岗位覆盖齐全。</div>
+        <div v-if="activeCoverage.length" class="warn-section">
+          <h4>当前小时缺岗</h4>
+          <div v-for="w in activeCoverage" :key="w.demand_id" class="warn-item" :class="w.level">
+            <b>{{ warnIcon(w.level) }} {{ w.msg }}</b>
+            <span class="tag" :class="w.type">{{ demandMeta[w.type]?.label || '调度' }}</span>
+          </div>
+        </div>
+        <div v-if="upcomingCoverage.length" class="warn-section">
+          <h4>即将到来的调度需求</h4>
+          <div v-for="w in upcomingCoverage" :key="w.demand_id" class="warn-item info">
+            <b>{{ warnIcon(w.level) }} {{ w.msg }}</b>
+            <span class="tag" :class="w.type">{{ demandMeta[w.type]?.label || '调度' }}</span>
+          </div>
+        </div>
+        <p class="muted tips">调度规则：每小时读取未来三天入园/设施预约量，按区域客流补派保安、保洁与会员专员；在途检修优先补维修工；未结投诉按类别和 SLA 补匹配岗位；17 点后安全/晚间客流触发跨日夜班。当前缺口要求已打卡在岗，未来缺口只要求有效排班；调班审批会联动复核原班与目标班。</p>
       </div>
     </template>
 
@@ -451,6 +500,11 @@ async function toggleAutoFill(v) {
 .sc-time { font-size: 11px; }
 .sc-tags { display: flex; gap: 4px; flex-wrap: wrap; }
 .sc-tags em { font-style: normal; font-size: 10px; background: rgba(102,166,255,.15); color: var(--blue); border-radius: 8px; padding: 0 6px; }
+.sc-tags em.demand { background: rgba(167,139,250,.16); color: var(--purple); }
+.sc-tags em.demand.traffic { background: rgba(102,166,255,.18); color: var(--blue); }
+.sc-tags em.demand.maintenance { background: rgba(255,158,100,.16); color: var(--accent2); }
+.sc-tags em.demand.complaint { background: rgba(255,107,107,.16); color: var(--red); }
+.sc-tags em.demand.night { background: rgba(40,45,80,.25); color: var(--purple); }
 .sc-tags em.money { background: rgba(109,213,160,.15); color: var(--green); }
 .sc-actions { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 2px; }
 .sm { padding: 3px 8px; font-size: 11px; }
@@ -496,8 +550,23 @@ async function toggleAutoFill(v) {
 .rq-foot { display: flex; gap: 8px; margin-top: 8px; justify-content: flex-end; }
 
 /* 覆盖 */
-.coverage .warn-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; border-radius: 10px; margin-bottom: 8px; background: rgba(255,209,102,.08); border: 1px solid rgba(255,209,102,.3); }
+.coverage-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+.coverage-head h3 { margin: 0; }
+.day-pills { display: flex; gap: 6px; flex-wrap: wrap; }
+.day-pills button { padding: 5px 10px; font-size: 12px; }
+.day-pills button.on { background: rgba(255,107,107,.18); border-color: rgba(255,107,107,.5); color: var(--accent); }
+.signal-bar { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.signal-bar span { font-size: 12px; color: var(--muted); background: var(--panel2); border: 1px solid var(--border); border-radius: 16px; padding: 4px 10px; }
+.signal-bar b { color: var(--text); }
+.warn-section { margin-bottom: 12px; }
+.warn-section h4 { margin: 0 0 8px; font-size: 13px; color: var(--muted); }
+.coverage .warn-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; border-radius: 10px; margin-bottom: 8px; background: rgba(255,209,102,.08); border: 1px solid rgba(255,209,102,.3); gap: 12px; }
 .coverage .warn-item.block { background: rgba(255,107,107,.1); border-color: rgba(255,107,107,.45); }
+.coverage .warn-item.info { background: rgba(102,166,255,.08); border-color: rgba(102,166,255,.28); }
+.coverage .tag.traffic { color: var(--blue); border-color: rgba(102,166,255,.35); }
+.coverage .tag.maintenance { color: var(--accent2); border-color: rgba(255,209,102,.4); }
+.coverage .tag.complaint { color: var(--red); border-color: rgba(255,107,107,.4); }
+.coverage .tag.night { color: var(--purple); border-color: rgba(167,139,250,.4); }
 .ok-box { padding: 16px; text-align: center; color: var(--green); background: rgba(109,213,160,.08); border: 1px solid rgba(109,213,160,.3); border-radius: 10px; }
 
 /* 弹窗 */

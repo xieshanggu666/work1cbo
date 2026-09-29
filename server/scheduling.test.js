@@ -9,6 +9,14 @@ import assert from 'node:assert/strict'
 
 const { default: db, getSetting, setSetting } = await import('./db.js')
 const SCH = await import('./scheduling.js')
+const MAINT = await import('./maintenance.js')
+const RSV = await import('./reservations.js')
+
+// 动态调度测试会通过检修模块建工单：注入预约联动，避免测试环境缺少外部上下文
+MAINT.initMaintenanceContext({
+  logFinance: (day, label, amount, detail) => finLogs.push({ day, label, amount, detail }),
+  syncRideSlots: ride => RSV.syncRideSlots(ride)
+})
 
 const finLogs = []
 SCH.initSchedulingContext({
@@ -64,10 +72,38 @@ test('排班：同日重复排班冲突拦截；不同日/不同员工可排', (
 
 test('岗位覆盖校验：无维修/保洁排班会产生缺岗预警', () => {
   const cov = SCH.coverageForDay(5)
-  // 第 5 天尚无任何排班（种子无排班），各开放区域与在途检修必然告警
+  // 第 5 天尚无任何排班（种子无排班），各开放区域基础岗位与在途检修必然告警
   assert.ok(cov.warnings.length > 0)
-  assert.ok(cov.warnings.some(w => w.type === 'zone_guard'))
-  assert.ok(cov.warnings.some(w => w.type === 'zone_clean'))
+  assert.ok(cov.warnings.some(w => w.type === 'baseline'))
+  assert.ok(cov.warnings.some(w => w.type === 'maintenance'))
+})
+
+test('动态补位：预约客流驱动区域岗位，检修工单和严重投诉优先补维修工/岗位', () => {
+  const day = 40
+  setClock(day, 9)
+  setSetting('scheduleAutoFill', 1)
+  // 未来高预约入园客流：保安、保洁按基础覆盖与高峰负荷补位
+  db.prepare(`INSERT INTO reservation_slots(scope,ride_id,day,hour,capacity,oversell,booked_count,status)
+              VALUES('entry',NULL,?,?,400,20,260,'open')`).run(day, 10)
+  db.prepare(`INSERT INTO reservation_slots(scope,ride_id,day,hour,capacity,oversell,booked_count,status)
+              VALUES('entry',NULL,?,?,400,20,260,'open')`).run(day, 13)
+  SCH.processScheduling()
+  const auto = db.prepare(`SELECT sc.*, s.role FROM staff_schedules sc JOIN staff s ON s.id=sc.staff_id
+                           WHERE sc.day=? AND sc.source='auto'`).all(day)
+  assert.ok(auto.some(x => ['保安', '安保'].includes(x.role)))
+  assert.ok(auto.some(x => x.role === '保洁'))
+  assert.ok(auto.every(x => x.demand_type), '动态排班必须记录需求来源')
+
+  // 新检修工单驱动维修工补位；严重投诉也生成对应岗位需求
+  const ride = db.prepare("SELECT * FROM rides WHERE status='operating' LIMIT 1").get()
+  const mo = MAINT.createMaintenanceOrder(ride.id, 'manual', '动态调度测试')
+  assert.equal(mo.ok, true)
+  SCH.processScheduling()
+  const repairSched = db.prepare(`SELECT sc.* FROM staff_schedules sc JOIN staff s ON s.id=sc.staff_id
+                                  WHERE sc.day=? AND sc.source='auto' AND s.role='维修'
+                                  AND sc.demand_type='maintenance'`).get(day)
+  assert.ok(repairSched, '在途检修工单应自动补排维修工')
+  setSetting('scheduleAutoFill', 0)
 })
 
 test('到点自动打卡（准时无迟到）；过点手动打卡记迟到；全程未到岗下班记旷工且无薪', () => {

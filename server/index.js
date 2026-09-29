@@ -836,7 +836,7 @@ app.get('/api/state', (req, res) => {
     benefitProducts: listBenefitProducts(),
     // 员工排班与工时结算
     shifts: listShiftTemplates(),
-    schedules: listSchedules({ from: state.day(), to: state.day() + 3, limit: 600 }),
+    schedules: listSchedules({ from: state.day() - 1, to: state.day() + 3, limit: 700 }),
     // 今日考勤：当日结算（含昨日上班今日下班的跨日夜班）+ 当前仍在岗
     attendance: listAttendance({ settleDay: state.day(), limit: 200 })
       .concat(listAttendance({ status: 'checked_in', limit: 100 }))
@@ -846,6 +846,7 @@ app.get('/api/state', (req, res) => {
     ),
     schedulingStats: schedulingStats(),
     coverageToday: coverageForDay(state.day()),
+    coverageByDay: [0, 1, 2, 3].reduce((m, x) => { m[state.day() + x] = coverageForDay(state.day() + x); return m }, {}),
     finance: fin,
     avgs: {
       satisfaction: computeSatisfaction(),
