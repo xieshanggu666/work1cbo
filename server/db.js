@@ -404,6 +404,7 @@ CREATE TABLE IF NOT EXISTS staff_schedules (
   shift_id INTEGER NOT NULL,
   day INTEGER NOT NULL,              -- 上班所属游戏日（跨日夜班归当日）
   status TEXT NOT NULL DEFAULT 'scheduled', -- scheduled 已排 / swap 调班中 / cancelled 已取消
+  source TEXT NOT NULL DEFAULT 'manual', -- manual 主管手排 / auto 基础自动补位 / dispatch 动态调度按缺口补位
   create_tick INTEGER NOT NULL DEFAULT 0,
   create_day INTEGER NOT NULL DEFAULT 0,
   note TEXT NOT NULL DEFAULT ''
@@ -454,6 +455,7 @@ CREATE TABLE IF NOT EXISTS shift_requests (
   ot_ticks INTEGER NOT NULL DEFAULT 0,
   reason TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'pending', -- pending 待批 / approved 已批 / rejected 驳回 / cancelled 已取消
+  source TEXT NOT NULL DEFAULT 'staff',    -- staff 员工发起 / dispatch 系统紧急加班调令（动态调度生成）
   approver_id INTEGER,
   create_tick INTEGER NOT NULL DEFAULT 0,
   create_day INTEGER NOT NULL DEFAULT 0,
@@ -495,6 +497,9 @@ ensureColumn('reservations', 'member_id', "member_id INTEGER")
 ensureColumn('reservations', 'benefit_id', "benefit_id INTEGER")
 // 投诉联动：会员本人投诉，可积分补偿结案
 ensureColumn('complaints', 'member_id', "member_id INTEGER")
+// 动态调度：排班/申请来源（manual/auto/dispatch；staff/dispatch）
+ensureColumn('staff_schedules', 'source', "source TEXT NOT NULL DEFAULT 'manual'")
+ensureColumn('shift_requests', 'source', "source TEXT NOT NULL DEFAULT 'staff'")
 
 // ---------- 事务 ----------
 // 多步写入（库存/订单/现金/流水/日志）必须原子提交：任一步失败整体回滚，不留半完成状态。
@@ -644,8 +649,12 @@ function seed() {
     ['night', '夜班', 17, 9, 1, 6, '#ff9e64', 4]   // 跨日夜班：当日 17:00 至次日 09:00
   ]
   shifts.forEach(s => ish.run(...s))
-  setIf('scheduleAutoFill', 1)            // 自动排班开关（引擎为未来两天无排班员工补排）
+  setIf('scheduleAutoFill', 1)            // 自动补位开关（引擎按需求为未来三天补齐缺口）
+  setIf('scheduleMode', 'dynamic')        // dynamic 动态调度（按客流/工单/投诉）；auto 全员基础补位
   setIf('otRateMul', 1.5)                 // 加班时薪倍率
+  setIf('dispatchGuardFlow', 500)         // 每名保安班段可承载的预约预测客流
+  setIf('dispatchCleanFlow', 700)         // 每名保洁班段可承载的预约预测客流
+  setIf('dispatchNightGuardsPerZone', 0)  // 夜勤保安区域配比（0=不强制）
 
   // 示例会员（新库首日建立；含一名金卡会员便于演示等级与权益流转）
   if (db.prepare('SELECT COUNT(*) n FROM members').get().n === 0) {
@@ -704,7 +713,15 @@ function ensureScheduleBaseData() {
     db.prepare('INSERT INTO staff(name,role,zone_id,wage,skill,morale,active) VALUES(?,?,?,?,?,?,?)')
       .run('林岚', '运营主管', 1, 420, 2, 80, 1)
   }
-  for (const [k, v] of [['scheduleAutoFill', 1], ['otRateMul', 1.5]]) {
+  for (const [k, v] of [
+    ['scheduleAutoFill', 1],       // 自动补位总开关
+    ['scheduleMode', 'dynamic'],   // auto=全员基础补位；dynamic=按客流/工单/投诉需求动态调度
+    ['otRateMul', 1.5],
+    // 动态调度参数：每个保安/保洁可承载的预约预测客流（人/班段）；夜班每个开放区域保安数
+    ['dispatchGuardFlow', 500],
+    ['dispatchCleanFlow', 700],
+    ['dispatchNightGuardsPerZone', 0]  // 0=夜班不强制（按需动态补）；>0 时每 N 个区域至少 1 名夜勤保安
+  ]) {
     if (!getSetting(k)) setSetting(k, String(v))
   }
 }

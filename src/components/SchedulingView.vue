@@ -5,12 +5,13 @@ import { useParkStore, newRequestId } from '@/store/park'
 const store = useParkStore()
 
 const tabs = [
+  { k: 'dispatch', label: '动态调度' },
   { k: 'board', label: '排班看板' },
   { k: 'attendance', label: '考勤工时' },
   { k: 'requests', label: '调班加班' },
   { k: 'coverage', label: '岗位覆盖' }
 ]
-const tab = ref('board')
+const tab = ref('dispatch')
 
 const today = computed(() => store.clock.day)
 const days = computed(() => {
@@ -129,21 +130,105 @@ async function reject(r) {
 }
 async function withdraw(r) { await store.cancelShiftRequest(r.id, r.staff_id) }
 
-// ---- 岗位覆盖 ----
-const coverage = computed(() => store.coverageToday)
+// ---- 岗位覆盖（可按日查看） ----
+const coverageDay = ref(today.value)
+const coverageData = ref(null)
+const coverage = computed(() => coverageData.value || store.coverageToday)
+async function loadCoverage(d) {
+  coverageDay.value = d
+  coverageData.value = null
+  const r = await store.coverageOf(d)
+  if (r?.coverage) coverageData.value = r.coverage
+}
 const warnIcon = lv => lv === 'block' ? '⛔' : '⚠️'
+
+// ---- 动态调度 ----
+const plan = computed(() => store.dispatchPlanData)
+const planDay = ref(today.value)
+const planDayData = computed(() => plan.value.days?.find(x => x.day === planDay.value) || plan.value.days?.[0] || null)
+const dispatchMsg = ref('')
+const dispatching = ref(false)
+const configForm = reactive({ mode: 'dynamic', guardFlow: 500, cleanFlow: 700, nightPerZone: 0 })
+const autoFill = ref(true)
+function syncConfigForm() {
+  configForm.mode = plan.value.mode || 'dynamic'
+  configForm.guardFlow = plan.value.params?.guardFlow ?? 500
+  configForm.cleanFlow = plan.value.params?.cleanFlow ?? 700
+  configForm.nightPerZone = plan.value.params?.nightGuardsPerZone ?? 0
+  autoFill.value = plan.value.autoFill !== 0
+}
+// 配置数据到位后同步一次
+if (plan.value.days?.length) syncConfigForm()
+import { watch } from 'vue'
+watch(() => [plan.value.mode, plan.value.params, plan.value.autoFill], syncConfigForm)
+
+async function saveConfig() {
+  const r = await store.saveScheduleConfig({
+    mode: configForm.mode,
+    guard_flow: Number(configForm.guardFlow),
+    clean_flow: Number(configForm.cleanFlow),
+    night_guards_per_zone: Number(configForm.nightPerZone)
+  })
+  dispatchMsg.value = r?.ok ? '调度参数已保存' : (r?.msg || '保存失败')
+  setTimeout(() => { dispatchMsg.value = '' }, 2500)
+}
+async function toggleAutoFill(v) {
+  autoFill.value = v
+  await store.saveScheduleConfig({ auto_fill: v ? 1 : 0 })
+}
+async function runDispatch() {
+  if (dispatching.value) return
+  dispatching.value = true
+  dispatchMsg.value = '动态调度执行中…'
+  const r = await store.runDispatch({ reason: '主管手动触发动态调度', request_id: newRequestId() })
+  dispatching.value = false
+  if (r?.ok) {
+    dispatchMsg.value = `补位完成：新增排班 ${r.created?.length || 0} 张，紧急加班调令 ${r.otRequests?.length || 0} 张（待主管审批）`
+  } else dispatchMsg.value = r?.msg || '调度失败'
+  setTimeout(() => { dispatchMsg.value = '' }, 4000)
+}
+const BAND_META = {
+  morning: { name: '早班', icon: '🌅', range: '09:00~12:00' },
+  mid: { name: '中班', icon: '☀️', range: '12:00~14:00' },
+  evening: { name: '晚班', icon: '🌇', range: '14:00~18:00' },
+  night: { name: '夜班', icon: '🌙', range: '17:00~次日09:00' }
+}
+function bandRows(d) {
+  return (d?.demand?.bands || []).map(b => {
+    const ws = (d.warnings || []).filter(w => w.band === b.key)
+    const blockN = ws.filter(w => w.level === 'block').length
+    const warnN = ws.filter(w => w.level !== 'block').length
+    const gapFor = role => {
+      const w = ws.find(x => x.role === role)
+      return w ? { gap: w.gap, level: w.level, need: w.need, have: w.have } : { gap: 0, level: '', need: 0, have: 0 }
+    }
+    return {
+      ...b, blockN, warnN, orders: b.orders || [],
+      gGuard: gapFor('保安/安保'), gClean: gapFor('保洁'), gRepair: gapFor('维修工')
+    }
+  })
+}
 
 // 排班状态徽标
 function schedState(s) {
   if (!s) return { text: '休息', cls: 'off' }
   if (s.status === 'cancelled') return { text: '已取消', cls: 'cancelled' }
   if (s.status === 'swap') return { text: '调班中', cls: 'swap' }
+  if (s.cross_day && s.night_phase) {
+    return {
+      upcoming: { text: '夜班待岗', cls: 'plan' },
+      night_on: { text: '🌙当夜值守', cls: 'night' },
+      morning_after: { text: '🌙凌晨值守', cls: 'night' },
+      done: { text: '夜班已结', cls: 'done' }
+    }[s.night_phase] || { text: '夜班', cls: 'night' }
+  }
   if (s.att_status === 'checked_in') return { text: s.on_duty ? '在岗' : '考勤中', cls: 'on' }
   if (s.att_status === 'checked_out') return { text: '已下班', cls: 'done' }
   if (s.att_status === 'absent') return { text: '旷工', cls: 'absent' }
   if (s.att_status === 'leave') return { text: '离岗', cls: 'leave' }
-  return { text: '已排班', cls: 'plan' }
+  return { text: s.source === 'dispatch' ? '动态补位' : '已排班', cls: s.source === 'dispatch' ? 'dispatch' : 'plan' }
 }
+const SOURCE_LABEL = { manual: '手排', auto: '基础自动', dispatch: '动态补位', swap: '调班接替' }
 
 // 时间线
 const detailLogs = ref([])
@@ -162,7 +247,7 @@ async function openReqLogs(r) {
 }
 function closeLogs() { detailLogs.value = [] }
 const ACTION_LABEL = {
-  schedule: '排班', autofill: '自动排班', cancel: '取消排班',
+  schedule: '排班', autofill: '基础自动排班', dispatch_fill: '动态补位', cancel: '取消排班',
   checkin: '打卡上班', late: '迟到', leave: '离岗', checkout: '下班结算', absent: '旷工',
   workdone: '完工回写',
   swap_request: '申请调班', swap_approve: '批准调班', swap_reject: '驳回调班',
@@ -170,13 +255,6 @@ const ACTION_LABEL = {
 }
 
 const stats = computed(() => store.schedulingStats)
-// 自动排班开关来自后端配置（scheduleAutoFill 未单独下发时用 /state 的排班数据反推不准，
-// 故用本地态初始化并在切换时落库；刷新页面后由引擎行为兜底）
-const autoFill = ref(true)
-async function toggleAutoFill(v) {
-  autoFill.value = v
-  await store.saveScheduleConfig({ auto_fill: v ? 1 : 0 })
-}
 </script>
 
 <template>
@@ -184,8 +262,12 @@ async function toggleAutoFill(v) {
     <div class="stat-grid">
       <div class="card stat"><span>🗓️</span><b>{{ stats.todayScheduled }}</b><em>今日排班</em></div>
       <div class="card stat"><span>👷</span><b class="on">{{ stats.onDuty }}</b><em>当前在岗</em></div>
+      <div class="card stat"><span>🌙</span><b>{{ stats.nightOnDuty || 0 }}</b><em>夜班凌晨值守</em></div>
       <div class="card stat" :class="{ alert: stats.absentToday }"><span>❌</span><b :class="stats.absentToday ? 'neg' : ''">{{ stats.absentToday }}</b><em>今日旷工</em></div>
       <div class="card stat"><span>⏰</span><b>{{ stats.lateToday }}</b><em>今日迟到</em></div>
+      <div class="card stat"><span>🚪</span><b>{{ stats.flowToday || 0 }}</b><em>预测客流(人)</em></div>
+      <div class="card stat"><span>🤖</span><b>{{ stats.dispatchFilledToday || 0 }}</b><em>今日动态补位</em></div>
+      <div class="card stat" :class="{ alert: stats.dispatchOtRequests }"><span>🆘</span><b>{{ stats.dispatchOtRequests || 0 }}</b><em>紧急调令待批</em></div>
       <div class="card stat"><span>🕑</span><b>{{ stats.overtimeHoursToday }}h</b><em>今日加班</em></div>
       <div class="card stat"><span>💰</span><b class="money neg">¥{{ (stats.payToday || 0).toLocaleString() }}</b><em>今日工时工资</em></div>
       <div class="card stat" :class="{ alert: stats.pendingRequests }"><span>📝</span><b>{{ stats.pendingRequests }}</b><em>待审批申请</em></div>
@@ -196,15 +278,118 @@ async function toggleAutoFill(v) {
       <button v-for="t in tabs" :key="t.k" :class="{ on: tab === t.k }" @click="tab = t.k">
         {{ t.label }}
         <i v-if="t.k === 'requests' && stats.pendingRequests" class="badge-dot">{{ stats.pendingRequests }}</i>
+        <i v-if="t.k === 'dispatch' && stats.dispatchOtRequests" class="badge-dot alert-dot">{{ stats.dispatchOtRequests }}</i>
       </button>
-      <label class="autofill" v-if="tab === 'board'">
-        <input type="checkbox" v-model="autoFill" @change="toggleAutoFill($event.target.checked)" />
-        自动排班（未来 3 天，引擎每小时补齐）
+      <label class="autofill" v-if="tab === 'board' || tab === 'dispatch'">
+        <input type="checkbox" :checked="autoFill" @change="toggleAutoFill($event.target.checked)" />
+        自动补位（引擎每小时巡检）
       </label>
     </div>
 
+    <!-- ============ 动态调度 ============ -->
+    <template v-if="tab === 'dispatch'">
+      <div class="card dispatch-head">
+        <div class="dh-row">
+          <div class="dh-mode">
+            <h3>🧠 动态调度引擎</h3>
+            <p class="muted">
+              融合 <b>分时预约客流</b>（入园 + 热门设施预约，未来日按散客均值外推）、<b>在途检修工单</b>、<b>待处置投诉岗位</b>
+              三类需求，按早/中/晚/跨日夜班核算岗位缺口，自动智能补位；当天已开始班段的硬缺口转<b>紧急加班调令</b>走主管审批。
+            </p>
+          </div>
+          <div class="dh-actions">
+            <label class="mode-switch">
+              调度模式
+              <select v-model="configForm.mode" @change="saveConfig">
+                <option value="dynamic">动态调度（按需求补缺口）</option>
+                <option value="auto">基础补位（全员轮排日班）</option>
+              </select>
+            </label>
+            <button class="primary" :disabled="dispatching || !autoFill" @click="runDispatch">
+              {{ dispatching ? '调度中…' : '🚀 立即执行动态补位' }}
+            </button>
+          </div>
+        </div>
+        <div class="dh-params">
+          <label>每名保安承载客流/班段（人）
+            <input type="number" v-model.number="configForm.guardFlow" min="100" max="5000" step="50" @change="saveConfig" />
+          </label>
+          <label>每名保洁承载客流/班段（人）
+            <input type="number" v-model.number="configForm.cleanFlow" min="100" max="5000" step="50" @change="saveConfig" />
+          </label>
+          <label>夜班保安区域配比（每 N 区 1 人，0=不强制）
+            <input type="number" v-model.number="configForm.nightPerZone" min="0" max="10" @change="saveConfig" />
+          </label>
+          <em class="mmsg" :class="{ bad: dispatchMsg.includes('失败') }">{{ dispatchMsg }}</em>
+        </div>
+      </div>
+
+      <div class="day-picker">
+        <button v-for="d in days.slice(0,3)" :key="d" :class="{ on: planDay === d }" @click="planDay = d">
+          {{ dayNames(d) }} · 第{{d}}天
+        </button>
+      </div>
+
+      <div v-if="planDayData" class="card plan-card">
+        <div class="plan-summary">
+          <span>预测总客流 <b>{{ planDayData.demand.flowTotal }}</b> 人</span>
+          <span>在途检修工单 <b :class="planDayData.demand.openOrders ? 'neg' : ''">{{ planDayData.demand.openOrders }}</b></span>
+          <span>待处置投诉 <b :class="planDayData.demand.openComplaints ? 'neg' : ''">{{ planDayData.demand.openComplaints }}</b></span>
+          <span>花名册 <b>{{ planDayData.rosterCount }}</b> 人</span>
+          <span class="muted">开放区域 {{ planDayData.demand.zones.length }} 个</span>
+        </div>
+
+        <div class="band-grid">
+          <div class="band-col" v-for="b in bandRows(planDayData)" :key="b.key" :class="{ blocked: b.blockN }">
+            <div class="band-head">
+              <b>{{ BAND_META[b.key].icon }} {{ BAND_META[b.key].name }}</b>
+              <em class="muted">{{ BAND_META[b.key].range }}</em>
+              <span v-if="b.key === 'night'" class="tag">跨日</span>
+            </div>
+            <div class="band-flow muted">班段客流合计 {{ b.flow }} · 峰值 {{ b.peak }}</div>
+            <div class="need-row" :class="b.gGuard.level">
+              <span>🛡️ 保安</span>
+              <b>需 {{ b.need_guard }}</b>
+              <em>缺 {{ b.gGuard.gap }}</em>
+            </div>
+            <div class="need-row" :class="b.gClean.level">
+              <span>🧹 保洁</span>
+              <b>需 {{ b.need_clean }}</b>
+              <em>缺 {{ b.gClean.gap }}</em>
+            </div>
+            <div class="need-row" :class="b.gRepair.level">
+              <span>🔧 维修工</span>
+              <b>需 {{ b.need_repair }}</b>
+              <em>缺 {{ b.gRepair.gap }}</em>
+            </div>
+            <div v-if="b.orders.length" class="band-refs">
+              <em v-for="o in b.orders" :key="o.id" class="ref-order" :class="o.status">{{ o.code }} · {{ o.ride_name }}</em>
+            </div>
+            <div v-if="b.complaints.length" class="band-refs">
+              <em v-for="c in b.complaints" :key="c.id" class="ref-comp" :class="'sev'+c.severity">{{ c.code }} · {{ c.roles.join('/') }}</em>
+            </div>
+            <div v-if="b.blockN" class="band-alert">⛔ {{ b.blockN }} 项硬缺岗（检修中/紧急投诉）</div>
+            <div v-else-if="b.warnN" class="band-warn">⚠️ {{ b.warnN }} 项缺口</div>
+            <div v-else class="band-ok">✅ 覆盖满足</div>
+          </div>
+        </div>
+
+        <div class="plan-warnings" v-if="planDayData.warnings.length">
+          <h4>缺口明细（{{ planDayData.warnings.length }}）</h4>
+          <div v-for="(w, i) in planDayData.warnings" :key="i" class="pw-item" :class="w.level">
+            <b>{{ warnIcon(w.level) }} {{ w.msg }}</b>
+            <span class="tag" v-if="w.band">{{ BAND_META[w.band]?.name }}</span>
+          </div>
+        </div>
+        <p class="muted tips">
+          补位规则：自动选择当日无排班、无前日夜班（疲劳规避）、区域/技能最匹配且近三日负载最低的员工；
+          已开始班段的硬需求优先排未开始的邻班接续，仍无法补位时生成紧急加班调令（1.5 倍时薪、主管审批后写入考勤顺延下班）。
+        </p>
+      </div>
+    </template>
+
     <!-- ============ 排班看板 ============ -->
-    <template v-if="tab === 'board'">
+    <template v-else-if="tab === 'board'">
       <div class="board-wrap card">
         <div class="board">
           <div class="bcol corner">
@@ -231,6 +416,7 @@ async function toggleAutoFill(v) {
                 </div>
                 <div class="sc-time muted">{{ schedOf(st.id, d).time_text }}</div>
                 <div class="sc-tags">
+                  <em class="src-tag" v-if="schedOf(st.id, d).source">{{ SOURCE_LABEL[schedOf(st.id, d).source] || schedOf(st.id, d).source }}</em>
                   <em v-if="schedOf(st.id, d).late">迟到</em>
                   <em v-if="schedOf(st.id, d).ot_approved">加班{{ schedOf(st.id, d).overtime_ticks }}h</em>
                   <em v-if="schedOf(st.id, d).work_ticks">出勤{{ schedOf(st.id, d).work_ticks }}h</em>
@@ -303,7 +489,7 @@ async function toggleAutoFill(v) {
           <button class="primary" @click="submitSchedule">排入班次</button>
           <em class="mmsg" :class="{ bad: formMsg.includes('失败') || formMsg.includes('冲突') || formMsg.includes('不能') }">{{ formMsg }}</em>
         </div>
-        <p class="muted tips">说明：同一员工同日仅允许一个有效排班（冲突拦截）；跨日夜班当日 17:00 上班、次日 09:00 下班并结算。排班会同步校验检修工单与待处置投诉的岗位覆盖。</p>
+        <p class="muted tips">说明：同一员工同日仅允许一个有效排班（冲突拦截）；跨日夜班当日 17:00 上班、次日 09:00 下班并结算，看板以「当夜值守 / 凌晨值守」区分跨日状态。开启动态调度时引擎会按客流/工单/投诉需求自动补位，也可在「动态调度」页一键执行。</p>
       </div>
     </template>
 
@@ -312,7 +498,7 @@ async function toggleAutoFill(v) {
       <div class="card">
         <div class="tabs">
           <button :class="{ on: attTab === 'today' }" @click="attTab = 'today'">今日结算</button>
-          <button :class="{ on: attTab === 'onduty' }" @click="attTab = 'onduty'">在岗中</button>
+          <button :class="{ on: attTab === 'onduty' }" @click="attTab = 'onduty'">在岗中（含跨日夜班）</button>
           <button :class="{ on: attTab === 'absent' }" @click="attTab === 'absent' ? attTab = 'all' : attTab = 'absent'">旷工/离岗</button>
         </div>
         <div class="atable">
@@ -334,7 +520,7 @@ async function toggleAutoFill(v) {
           </div>
           <div class="muted empty" v-if="!attendanceList.length">暂无考勤记录，引擎会在班次开始时自动打卡。</div>
         </div>
-        <p class="muted tips">工资口径：时薪 = 日薪 ÷ 5；下班按班次基准工时结算，加班按 {{ store.data ? '1.5' : '1.5' }} 倍时薪另计，旷工无薪，中途离岗按实际出勤比例折算。每张考勤单下班时逐条写入「工资」财务流水，跨日夜班计入次日。</p>
+        <p class="muted tips">工资口径：时薪 = 日薪 ÷ 5；下班按班次基准工时结算，加班按 1.5 倍时薪另计，旷工无薪，中途离岗按实际出勤比例折算。每张考勤单下班时逐条写入「工资」财务流水；跨日夜班次日 09:00 下班、结算计入次日工资。</p>
       </div>
     </template>
 
@@ -348,9 +534,11 @@ async function toggleAutoFill(v) {
           <button :class="{ on: reqTab === 'all' }" @click="reqTab = 'all'">全部</button>
         </div>
         <div class="reqlist">
-          <div class="req card2" v-for="r in requestList" :key="r.id">
+          <div class="req card2" v-for="r in requestList" :key="r.id" :class="{ dispatch: r.source === 'dispatch' }">
             <div class="rq-head">
-              <span class="rq-kind" :class="r.kind">{{ r.kind === 'swap' ? '🔄 调班申请' : '🕑 加班申请' }}</span>
+              <span class="rq-kind" :class="r.kind">
+                {{ r.source === 'dispatch' ? '🆘 系统紧急调令' : (r.kind === 'swap' ? '🔄 调班申请' : '🕑 加班申请') }}
+              </span>
               <span class="mono muted">{{ r.code }}</span>
               <span class="abadge" :class="reqStatusMeta(r.status).cls">{{ reqStatusMeta(r.status).label }}</span>
             </div>
@@ -373,7 +561,7 @@ async function toggleAutoFill(v) {
               <template v-if="r.status === 'pending'">
                 <button class="succ sm" @click="approve(r)">主管批准</button>
                 <button class="danger sm" @click="reject(r)">驳回</button>
-                <button class="ghost sm" @click="withdraw(r)">员工撤回</button>
+                <button v-if="r.source !== 'dispatch'" class="ghost sm" @click="withdraw(r)">员工撤回</button>
               </template>
             </div>
           </div>
@@ -384,14 +572,21 @@ async function toggleAutoFill(v) {
 
     <!-- ============ 岗位覆盖 ============ -->
     <template v-else>
+      <div class="day-picker">
+        <button v-for="d in days" :key="d" :class="{ on: coverageDay === d }" @click="loadCoverage(d)">{{ dayNames(d) }} · 第{{d}}天</button>
+      </div>
       <div class="card coverage">
-        <h3>🛡️ 今日岗位覆盖校验（第 {{ today }} 天 · 在岗花名册 {{ coverage.rosterCount }} 人）</h3>
-        <div v-if="!coverage.warnings.length" class="ok-box">✅ 各开放区域、在途检修工单与待处置投诉的岗位覆盖齐全。</div>
+        <h3>🛡️ 岗位覆盖校验（第 {{ coverageDay }} 天 · 在岗花名册 {{ coverage.rosterCount }} 人）</h3>
+        <div v-if="!coverage.warnings.length" class="ok-box">✅ 各开放区域、预约客流高峰、在途检修工单与待处置投诉的岗位覆盖齐全。</div>
         <div v-for="(w, i) in coverage.warnings" :key="i" class="warn-item" :class="w.level">
           <b>{{ warnIcon(w.level) }} {{ w.msg }}</b>
-          <span class="tag">{{ w.type === 'maintenance' ? '设施检修' : w.type.startsWith('zone') ? '区域岗位' : '投诉处置' }}</span>
+          <span class="tag">{{ w.band ? BAND_META[w.band]?.name : (w.type === 'maintenance' ? '设施检修' : w.type.startsWith('zone') ? '区域岗位' : '投诉处置') }}</span>
         </div>
-        <p class="muted tips">覆盖规则：每个开放区域需有保安/安保与保洁当班；在途检修工单（尤其检修中）需有维修工；待处置投诉需有岗位匹配员工。缺口仅预警不强制（可加班/调班补齐）；真正的同日重复排班为硬冲突，在排班与调班审批时拦截。</p>
+        <p class="muted tips">
+          覆盖规则：班段 × 岗位（保安/保洁/维修）需求由预约客流、在途检修工单与待处置投诉共同驱动；
+          缺口在未来班段为黄色预警（引擎自动补位/主管调班），当天班段已开始且为检修中工单或紧急投诉时为 ⛔ 红色硬缺岗，
+          会自动生成紧急加班调令。真正的同日重复排班为硬冲突，在排班与调班审批时拦截。
+        </p>
       </div>
     </template>
 
@@ -415,7 +610,7 @@ async function toggleAutoFill(v) {
 
 <style scoped>
 .sch { display: flex; flex-direction: column; gap: 14px; }
-.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; }
 .stat { display: flex; flex-direction: column; gap: 2px; padding: 14px; }
 .stat span { font-size: 20px; }
 .stat b { font-size: 24px; }
@@ -427,7 +622,52 @@ async function toggleAutoFill(v) {
 .tabs button { position: relative; }
 .tabs button.on { background: rgba(255,107,107,.18); border-color: rgba(255,107,107,.5); color: var(--accent); }
 .badge-dot { font-style: normal; background: var(--accent); color: #fff; border-radius: 20px; font-size: 10px; padding: 0 6px; margin-left: 4px; }
+.alert-dot { background: var(--red); }
 .autofill { margin-left: auto; font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+
+/* 动态调度 */
+.dispatch-head { display: flex; flex-direction: column; gap: 12px; }
+.dh-row { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.dh-mode { flex: 1; min-width: 280px; }
+.dh-mode h3 { margin: 0 0 6px; }
+.dh-mode p { margin: 0; font-size: 12px; line-height: 1.7; }
+.dh-actions { display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
+.mode-switch { font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 4px; }
+.mode-switch select { min-width: 220px; }
+.dh-params { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; }
+.dh-params label { font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 4px; }
+.dh-params input { width: 110px; }
+.mmsg { font-size: 12px; color: var(--green); }
+.mmsg.bad { color: var(--red); }
+.day-picker { display: flex; gap: 8px; flex-wrap: wrap; }
+.day-picker button { padding: 7px 14px; border-radius: 18px; border: 1px solid var(--border); background: var(--panel); cursor: pointer; font-size: 13px; }
+.day-picker button.on { background: rgba(255,107,107,.16); border-color: rgba(255,107,107,.5); color: var(--accent); font-weight: 700; }
+.plan-card { display: flex; flex-direction: column; gap: 12px; }
+.plan-summary { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
+.plan-summary b { color: var(--text); font-size: 15px; margin: 0 2px; }
+.band-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+.band-col { border: 1px solid var(--border); border-radius: 12px; padding: 12px; background: var(--panel2); display: flex; flex-direction: column; gap: 7px; }
+.band-col.blocked { border-color: rgba(255,107,107,.5); background: rgba(255,107,107,.06); }
+.band-head { display: flex; align-items: center; gap: 8px; }
+.band-head em { font-style: normal; font-size: 11px; }
+.band-flow { font-size: 11px; }
+.need-row { display: flex; justify-content: space-between; align-items: center; font-size: 13px; padding: 4px 8px; border-radius: 8px; background: rgba(255,255,255,.03); }
+.need-row b { font-weight: 600; }
+.need-row em { font-style: normal; font-size: 12px; color: var(--muted); }
+.need-row.block em, .need-row.warn em { color: var(--red); font-weight: 700; }
+.need-row.block { background: rgba(255,107,107,.1); }
+.need-row.warn { background: rgba(255,209,102,.08); }
+.band-refs { display: flex; flex-direction: column; gap: 3px; }
+.ref-order, .ref-comp { font-style: normal; font-size: 10px; padding: 2px 7px; border-radius: 8px; background: rgba(102,166,255,.12); color: var(--blue); }
+.ref-order.processing { background: rgba(255,107,107,.15); color: var(--red); }
+.ref-comp.sev3 { background: rgba(255,107,107,.15); color: var(--red); }
+.ref-comp.sev2 { background: rgba(255,209,102,.15); color: var(--accent2); }
+.band-alert { font-size: 12px; color: var(--red); font-weight: 700; margin-top: auto; }
+.band-warn { font-size: 12px; color: var(--accent2); margin-top: auto; }
+.band-ok { font-size: 12px; color: var(--green); margin-top: auto; }
+.plan-warnings h4 { margin: 4px 0; font-size: 13px; }
+.pw-item { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 8px; margin-bottom: 6px; font-size: 12px; background: rgba(255,209,102,.07); border: 1px solid rgba(255,209,102,.25); }
+.pw-item.block { background: rgba(255,107,107,.09); border-color: rgba(255,107,107,.4); }
 
 /* 排班看板 */
 .board-wrap { overflow-x: auto; padding: 14px; }
@@ -445,12 +685,15 @@ async function toggleAutoFill(v) {
 .shift-card { background: var(--panel2); border: 1px solid var(--border); border-left-width: 3px; border-radius: 10px; padding: 8px 10px; display: flex; flex-direction: column; gap: 4px; }
 .shift-card.absent { border-color: var(--red) !important; background: rgba(255,107,107,.1); }
 .shift-card.leave { opacity: .75; }
+.shift-card.night { background: rgba(167,139,250,.12); border-color: rgba(167,139,250,.5) !important; }
+.shift-card.dispatch { border-left-color: var(--green) !important; }
 .sc-top { display: flex; justify-content: space-between; align-items: center; }
 .sc-name { font-weight: 700; font-size: 13px; }
 .sc-state { font-size: 11px; color: var(--muted); }
 .sc-time { font-size: 11px; }
 .sc-tags { display: flex; gap: 4px; flex-wrap: wrap; }
 .sc-tags em { font-style: normal; font-size: 10px; background: rgba(102,166,255,.15); color: var(--blue); border-radius: 8px; padding: 0 6px; }
+.sc-tags em.src-tag { background: rgba(109,213,160,.15); color: var(--green); }
 .sc-tags em.money { background: rgba(109,213,160,.15); color: var(--green); }
 .sc-actions { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 2px; }
 .sm { padding: 3px 8px; font-size: 11px; }
@@ -461,8 +704,6 @@ async function toggleAutoFill(v) {
 .assign-card { margin-top: 0; }
 .assign-row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
 .assign-row label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
-.mmsg { font-size: 12px; color: var(--green); }
-.mmsg.bad { color: var(--red); }
 .tips { margin-top: 10px; font-size: 12px; line-height: 1.6; }
 
 /* 考勤表 */
@@ -485,6 +726,7 @@ async function toggleAutoFill(v) {
 /* 申请 */
 .reqlist { display: flex; flex-direction: column; gap: 10px; }
 .card2 { background: var(--panel2); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; }
+.req.dispatch { border-color: rgba(255,107,107,.5); background: rgba(255,107,107,.05); }
 .rq-head { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
 .rq-kind { font-weight: 700; font-size: 13px; }
 .rq-kind.swap { color: var(--blue); } .rq-kind.overtime, .rq-kind { color: var(--purple); }

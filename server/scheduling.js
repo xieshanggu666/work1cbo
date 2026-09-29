@@ -88,7 +88,9 @@ const fail = (code, msg, extra = {}) => ({ ok: false, code, msg, ...extra })
 
 // ---------------- 排班 ----------------
 // 运营主管排班：校验员工在岗、班次有效、时间未过、同日冲突（DB 部分唯一索引兜底）
-export function createSchedule({ staffId, shiftId, day, note = '', source = 'manual', requestId = '' }) {
+// source: manual 主管手排 / auto 基础自动补位 / dispatch 动态调度按缺口补位
+// allowStarted：动态调度内部使用，允许补入刚开始的班段（引擎会在下一小时自动打卡；已结束仍拒绝）
+export function createSchedule({ staffId, shiftId, day, note = '', source = 'manual', requestId = '', allowStarted = false }) {
   return idempotent('schedule_create', requestId, () => {
     try {
       return tx(() => {
@@ -100,23 +102,30 @@ export function createSchedule({ staffId, shiftId, day, note = '', source = 'man
         if (!Number.isInteger(day) || day < ctx.day()) return fail('DAY_PAST', '不能为已过去的游戏日排班')
         const t = ctx.tick()
         const begin = linear(day, sh.start_hour)
-        if (day === ctx.day() && begin <= t) return fail('SHIFT_STARTED', '该班次今日已开始，请选择尚未开始的班次')
+        const endB = sh.cross_day ? linear(day + 1, sh.end_hour) : linear(day, sh.end_hour)
+        if (day === ctx.day() && begin <= t) {
+          if (!allowStarted) return fail('SHIFT_STARTED', '该班次今日已开始，请选择尚未开始的班次')
+          if (t >= endB) return fail('SHIFT_ENDED', '该班次已结束，无法补位')
+        }
         const exist = effectiveScheduleOf(st.id, day)
         if (exist) return fail('SHIFT_CONFLICT', `${st.name} 当日已有排班，存在排班冲突`, { conflict_id: exist.id })
 
-        const ins = db.prepare(`INSERT INTO staff_schedules(staff_id,shift_id,day,status,create_tick,create_day,note)
-                               VALUES(?,?,?,'scheduled',?,?,?)`)
-          .run(st.id, sh.id, day, ctx.tick(), ctx.day(), note || (source === 'auto' ? '系统自动排班' : '运营主管排班'))
+        const src = ['manual', 'auto', 'dispatch'].includes(source) ? source : 'manual'
+        const ins = db.prepare(`INSERT INTO staff_schedules(staff_id,shift_id,day,status,source,create_tick,create_day,note)
+                               VALUES(?,?,?, 'scheduled',?,?,?,?)`)
+          .run(st.id, sh.id, day, src, ctx.tick(), ctx.day(),
+            note || (src === 'auto' ? '系统基础自动排班' : src === 'dispatch' ? '动态调度按岗位缺口补位' : '运营主管排班'))
         const id = Number(ins.lastInsertRowid)
         const code = 'PB' + String(id).padStart(4, '0')
         db.prepare('UPDATE staff_schedules SET code=? WHERE id=?').run(code, id)
         logShift({
-          scheduleId: id, action: source === 'auto' ? 'autofill' : 'schedule',
+          scheduleId: id,
+          action: src === 'dispatch' ? 'dispatch_fill' : src === 'auto' ? 'autofill' : 'schedule',
           note: `${st.name} 排入 ${sh.name}（${sh.cross_day ? `第${day}天 ` : ''}${sh.start_hour}:00${sh.cross_day ? ` ~ 次日 ${sh.end_hour}:00` : ` ~ ${sh.end_hour}:00`}）`,
           staffId: st.id
         })
         const warnings = coverageForDay(day).warnings
-        return { ok: true, id, code, staff_id: st.id, day, shift_id: sh.id, warnings }
+        return { ok: true, id, code, staff_id: st.id, day, shift_id: sh.id, source: src, warnings }
       })
     } catch (e) {
       if (String(e.message).includes('UNIQUE')) {
@@ -367,10 +376,12 @@ export function requestSwap({ staffId, scheduleId, targetStaffId, targetShiftId,
   })
 }
 
-// 运营主管审批调班：原子完成「原排班取消 + 代班人新排班」，任一步失败整体回滚
+// 运营主管审批调班：原子完成「原排班取消 + 代班人新排班」，任一步失败整体回滚；
+// 提交后触发动态调度补齐调班留下的覆盖缺口
 export function approveSwap(requestId, approverId) {
+  let result
   try {
-    return tx(() => {
+    result = tx(() => {
       const rq = db.prepare("SELECT * FROM shift_requests WHERE id=? AND kind='swap' AND status='pending'").get(requestId)
       if (!rq) return fail('REQUEST_GONE', '调班申请不存在或已处理')
       const src = db.prepare('SELECT * FROM staff_schedules WHERE id=?').get(rq.schedule_id)
@@ -387,8 +398,8 @@ export function approveSwap(requestId, approverId) {
       // 原排班取消（不会产生考勤，尚无打卡）
       db.prepare("UPDATE staff_schedules SET status='cancelled', note=? WHERE id=?")
         .run(`调班转出 → ${target.name}（${rq.code}）`, src.id)
-      const insNs = db.prepare(`INSERT INTO staff_schedules(staff_id,shift_id,day,status,create_tick,create_day,note)
-                               VALUES(?,?,?,'scheduled',?,?,?)`)
+      const insNs = db.prepare(`INSERT INTO staff_schedules(staff_id,shift_id,day,status,source,create_tick,create_day,note)
+                               VALUES(?,?,?,'scheduled','swap',?,?,?)`)
         .run(target.id, sh.id, rq.target_day, t, ctx.day(), `调班接替 ${from.name}（${rq.code}）`)
       const ns = Number(insNs.lastInsertRowid)
       const nsCode = 'PB' + String(ns).padStart(4, '0')
@@ -397,13 +408,23 @@ export function approveSwap(requestId, approverId) {
         .run(approverId, t, rq.id)
       logShift({ scheduleId: src.id, requestId: rq.id, action: 'swap_approve', note: `调班批准：${from.name} → ${target.name}（第 ${rq.target_day} 天 ${sh.name}）`, approverId })
       logShift({ scheduleId: ns, requestId: rq.id, action: 'schedule', note: `${target.name} 调班接替排班`, staffId: target.id })
-      return { ok: true, new_schedule_id: ns, warnings: coverageForDay(rq.target_day).warnings }
+      return { ok: true, new_schedule_id: ns, affectedDays: [src.day, rq.target_day] }
     })
   } catch (e) {
     if (String(e.message).includes('UNIQUE')) return fail('SHIFT_CONFLICT', '代班人目标日已有排班，调班冲突')
     console.error('[scheduling] 调班审批失败，已整体回滚:', e)
     return fail('TX_FAILED', '系统繁忙，审批未生效，请稍后重试')
   }
+  // 审批提交后再联动动态补位（补位失败不影响审批结果）
+  if (result?.ok) {
+    const days = result.affectedDays || []
+    const dispatch = num(getSetting('scheduleAutoFill'), 1) && getSetting('scheduleMode', 'dynamic') === 'dynamic'
+      ? runDynamicDispatch({ horizon: 3, urgentOvertime: true, reason: '调班审批后覆盖缺口补齐' })
+      : null
+    result.warnings = coverageForDay(days[days.length - 1] || ctx.day()).warnings
+    result.dispatch = dispatch
+  }
+  return result
 }
 
 // 驳回调班：原排班恢复
@@ -500,60 +521,453 @@ export function cancelRequest(requestId, staffId) {
   })
 }
 
-// ---------------- 岗位覆盖校验 ----------------
-const GUARD_ROLES = ['保安', '安保']
-// 某日有效排班对应的在岗员工集合
+// ---------------- 需求画像（预约客流 / 检修工单 / 投诉岗位 → 班段×岗位需求） ----------------
+// 班段 → 班次：早班/中班/晚班/跨日夜班；HOURS 为该班段在营业时段内覆盖的小时
+const BANDS = [
+  { key: 'morning', shift_code: 'morning', label: '早班', hours: [9, 10, 11] },
+  { key: 'mid', shift_code: 'mid', label: '中班', hours: [12, 13] },
+  { key: 'evening', shift_code: 'evening', label: '晚班', hours: [14, 15, 16, 17] },
+  { key: 'night', shift_code: 'night', label: '夜班', hours: [17] }
+]
+const GUARD_ROLE_SET = ['保安', '安保']
+const ROLE_GROUP = { guard: GUARD_ROLE_SET, clean: ['保洁'], repair: ['维修'] }
+// 缺口对象中的角色名 → 角色数组
+const ROLES_BY_NAME = { '保安/安保': GUARD_ROLE_SET, '保洁': ['保洁'], '维修工': ['维修'] }
+
+// 历史散客均值（近 3 天每时段实际入园 - 预约核销入园），用于未来日客流预测；无历史时回落到基准值
+function avgWalkinByHour() {
+  const rows = db.prepare(`
+    SELECT hour,
+           AVG(count) avg_total,
+           AVG((SELECT COALESCE(SUM(r.qty),0) FROM reservations r
+                WHERE r.status='checked' AND r.scope='entry' AND r.slot_day=v.day AND r.slot_hour=v.hour)) avg_rsv
+    FROM visitors v
+    WHERE day BETWEEN ? AND ?
+    GROUP BY hour`).all(Math.max(1, ctx.day() - 3), ctx.day() - 1)
+  const map = new Map()
+  for (const r of rows) map.set(r.hour, Math.max(0, num(r.avg_total) - num(r.avg_rsv)))
+  return map
+}
+
+// 某日每营业小时的预约客流预测（入园预约 + 热门设施预约折算 + 未来日散客外推）
+function hourlyFlow(day, walkMap) {
+  const out = []
+  for (let hour = OPEN_HOUR; hour <= CLOSE_HOUR; hour++) {
+    const entry = db.prepare("SELECT COALESCE(SUM(booked_count),0) n FROM reservation_slots WHERE scope='entry' AND day=? AND hour=?")
+      .get(day, hour).n
+    const ride = db.prepare("SELECT COALESCE(SUM(booked_count),0) n FROM reservation_slots WHERE scope='ride' AND day=? AND hour=?")
+      .get(day, hour).n
+    let flow = entry + Math.round(ride * 0.35)   // 设施排队同样产生秩序/保洁压力
+    if (day > ctx.day()) {
+      // 未来日：按近 3 天散客均值外推（新园无历史时，用基准客流的时段系数兜底）
+      const hist = walkMap.get(hour)
+      flow += hist ? Math.round(hist * 0.6) : Math.round(num(getSetting('guestBase'), 600) * (hour <= 10 ? 0.5 : hour >= 16 ? 0.6 : 1) * 0.6)
+    }
+    out.push({ hour, entry, ride: Math.round(ride * 0.35), flow })
+  }
+  return out
+}
+
+// 某日需求画像：班段 × 岗位（保安/保洁/维修）需求人数与依据
+export function demandForDay(day) {
+  day = Math.round(num(day))
+  const walkMap = avgWalkinByHour()
+  const hours = hourlyFlow(day, walkMap)
+  const openZones = db.prepare('SELECT id,name FROM zones WHERE open=1 AND unlocked=1 ORDER BY id').all()
+  const zoneN = openZones.length
+  const guardFlowPer = Math.max(100, num(getSetting('dispatchGuardFlow'), 500))
+  const cleanFlowPer = Math.max(100, num(getSetting('dispatchCleanFlow'), 700))
+
+  const bands = BANDS.map(b => {
+    const hs = hours.filter(h => b.hours.includes(h.hour))
+    const flow = hs.reduce((s, h) => s + h.flow, 0)
+    const peak = hs.reduce((m, h) => Math.max(m, h.flow), 0)
+    return {
+      key: b.key, label: b.label, shift_code: b.shift_code, hours: b.hours,
+      flow, peak,
+      // 客流驱动：每满一个承载阈值增配 1 人；至少保障每个班段有人（区域基线另行全日校验）
+      need_guard: Math.max(zoneN ? 1 : 0, Math.ceil(peak / guardFlowPer)),
+      need_clean: Math.max(zoneN ? 1 : 0, Math.ceil(flow / cleanFlowPer)),
+      need_repair: 0,
+      complaints: []
+    }
+  })
+  const bandOf = k => bands.find(x => x.key === k)
+
+  // 检修工单需求：每个在途工单需 1 名维修工；检修中优先排到早/中班推进，排队工单排早班接单
+  const orders = db.prepare(`SELECT mo.id, mo.code, mo.status, mo.progress, r.name ride_name, r.zone_id
+                             FROM maintenance_orders mo JOIN rides r ON r.id=mo.ride_id
+                             WHERE mo.status IN ('queued','processing') ORDER BY mo.status, mo.id`).all()
+  for (const o of orders) {
+    const target = o.status === 'processing' ? (bandOf('mid').need_repair <= bandOf('morning').need_repair ? 'mid' : 'morning') : 'morning'
+    bandOf(target).need_repair += 1
+    const b = bandOf(target)
+    ;(b.orders ||= []).push({ id: o.id, code: o.code, status: o.status, ride_name: o.ride_name, progress: o.progress, zone_id: o.zone_id })
+  }
+
+  // 投诉岗位需求：按岗位分组（保安类/保洁/维修）；紧急投诉优先早班，其余按严重度摊到早/中/晚
+  const compBands = ['morning', 'mid', 'evening']
+  const complaints = db.prepare("SELECT id,code,category,severity,status FROM complaints WHERE status IN ('open','processing','ready') ORDER BY severity DESC,id LIMIT 40").all()
+  let compCursor = 0
+  for (const c of complaints) {
+    const roles = (ctx.complaintRoles?.[c.category] || []).filter(Boolean)
+    if (!roles.length) continue   // 服务态度/价格争议无专属岗位，不进入排班需求
+    let group = roles.some(r => GUARD_ROLE_SET.includes(r)) ? 'guard'
+      : roles.includes('保洁') ? 'clean'
+      : roles.includes('维修') ? 'repair' : null
+    if (!group) continue
+    const key = c.severity === 3 ? 'morning' : compBands[compCursor++ % compBands.length]
+    const b = bandOf(key)
+    b.complaints.push({ id: c.id, code: c.code, category: c.category, severity: c.severity, roles })
+  }
+  for (const b of bands) {
+    const byRole = { guard: 0, clean: 0, repair: 0 }
+    for (const c of b.complaints) {
+      const g = c.roles.some(r => GUARD_ROLE_SET.includes(r)) ? 'guard' : c.roles.includes('保洁') ? 'clean' : 'repair'
+      byRole[g] += 1
+    }
+    b.need_guard = Math.max(b.need_guard, byRole.guard > 0 ? 1 : 0)
+    b.need_clean = Math.max(b.need_clean, byRole.clean > 0 ? 1 : 0)
+    b.need_repair = b.need_repair + (byRole.repair > 0 ? 1 : 0)
+  }
+
+  // 跨日夜班需求：每 N 个开放区域至少 1 名夜勤保安（默认 N=0 不强制，运营可调）
+  const nightPerZone = Math.max(0, num(getSetting('dispatchNightGuardsPerZone'), 0))
+  bandOf('night').need_guard = nightPerZone > 0 ? Math.max(1, Math.ceil(zoneN / nightPerZone)) : 0
+  bandOf('night').need_clean = 0
+  bandOf('night').need_repair = 0
+
+  return {
+    day,
+    isToday: day === ctx.day(),
+    zones: openZones,
+    hours,
+    bands,
+    flowTotal: hours.reduce((s, h) => s + h.flow, 0),
+    openOrders: orders.length,
+    openComplaints: complaints.length
+  }
+}
+
+// ---------------- 岗位覆盖校验（需求驱动：班段 × 岗位 需/在岗对比 + 跨日夜班） ----------------
+const GUARD_ROLES = GUARD_ROLE_SET
+// 某日有效排班对应的在岗员工集合（含前一日跨日夜班在当日早晨仍在岗的人员）
 function roster(day) {
-  return db.prepare(`
-    SELECT s.*, sc.id schedule_id, sc.status sched_status, sh.id shift_id, sh.code shift_code, sh.name shift_name,
-           sh.start_hour, sh.end_hour, sh.cross_day, sh.color, sh.standard_hours
+  const list = db.prepare(`
+    SELECT s.*, sc.id schedule_id, sc.day sched_day, sc.status sched_status, sc.source sched_source,
+           sh.id shift_id, sh.code shift_code, sh.name shift_name,
+           sh.start_hour, sh.end_hour, sh.cross_day, sh.color, sh.standard_hours,
+           a.id att_id, a.status att_status, a.overtime_ticks, a.late
     FROM staff_schedules sc
     JOIN staff s ON s.id=sc.staff_id
     JOIN shift_templates sh ON sh.id=sc.shift_id
-    WHERE sc.day=? AND sc.${EFFECTIVE} AND s.active=1`).all(day)
+    LEFT JOIN staff_attendance a ON a.schedule_id=sc.id
+    WHERE sc.${EFFECTIVE} AND s.active=1
+      AND (sc.day=? OR (sh.cross_day=1 AND sc.day=?))`).all(day, day - 1)
+  const t = ctx.tick()
+  return list.map(s => {
+    const begin = linear(s.sched_day, s.start_hour)
+    const end = (s.cross_day ? linear(s.sched_day + 1, s.end_hour) : linear(s.sched_day, s.end_hour)) + (s.overtime_ticks || 0)
+    return { ...s, begin_linear: begin, end_linear: end, on_duty_now: s.att_status === 'checked_in' && t >= begin && t < end }
+  })
 }
 
-// 排班/调班后校验当日岗位覆盖：硬冲突由唯一索引拦截，这里给出岗位缺口预警
-// - 每个开放区域需有保安/保洁覆盖；
-// - 在途设施检修工单需有维修工当班；
-// - 待处置投诉需有岗位匹配的员工当班（岗位表由 index.js 注入）
+// 班段内某岗位在岗/已排人数；当天按真实考勤时段统计，未来/过去日按排班统计
+function countByBand(list, day, bandKey, roleCheck) {
+  const band = BANDS.find(b => b.key === bandKey)
+  const t = ctx.tick()
+  return list.filter(s => {
+    if (!roleCheck(s.role)) return false
+    if (s.cross_day) {
+      // 跨日夜班只计入其上班日的晚班 17 点与夜班；前一日夜班在当日 9 点结束，不计入当日早班
+      return day === s.sched_day && (bandKey === 'night' || (bandKey === 'evening' && band.hours.includes(17)))
+    }
+    if (s.sched_day !== day) return false
+    if (day === ctx.day()) {
+      // 当天：已下班/旷工/离岗不计当前在岗，未开始班次按"将到岗"统计（供未来小时预警区分）
+      if (band.hours.some(h => linear(day, h) <= t)) {
+        return !!s.on_duty_now && band.hours.some(h => { const l = linear(day, h); return l >= s.begin_linear && l < s.end_linear })
+      }
+      return band.shift_code === s.shift_code
+    }
+    return band.shift_code === s.shift_code
+  }).length
+}
+
+// 排班/调班后校验当日岗位覆盖：客流/检修/投诉需求与班段在岗对比，给出量化缺口预警
+// - warn：未来班段/未来日缺口，可由动态调度自动补位或主管调班补齐；
+// - block：当天班段已经开始且在岗不足（检修中工单/紧急投诉无匹配岗位时升级为 block）
 export function coverageForDay(day) {
+  day = Math.round(num(day))
   const warnings = []
   const list = roster(day)
-  const push = (type, level, msg, ref = null) => warnings.push({ type, level, msg, ...(ref ? { ref_type: ref.type, ref_id: ref.id, ref_name: ref.name } : {}) })
+  const push = (type, level, msg, extra = {}) => warnings.push({ type, level, msg, ...extra })
+  const isToday = day === ctx.day()
+  const t = ctx.tick()
+  const bandStarted = b => isToday && b.hours.some(h => linear(day, h) <= t)
 
+  // 1) 区域全日基线：每个开放区域需有保安/安保与保洁（按员工归属区域）
   const zones = db.prepare('SELECT * FROM zones WHERE open=1 AND unlocked=1 ORDER BY id').all()
   for (const z of zones) {
-    const here = list.filter(s => s.zone_id === z.id)
-    if (!here.some(s => GUARD_ROLES.includes(s.role))) push('zone_guard', 'warn', `「${z.name}」无保安/安保当班，秩序岗位缺岗`, { type: 'zone', id: z.id, name: z.name })
-    if (!here.some(s => s.role === '保洁')) push('zone_clean', 'warn', `「${z.name}」无保洁当班，卫生岗位缺岗`, { type: 'zone', id: z.id, name: z.name })
+    const here = list.filter(s => s.zone_id === z.id && !s.cross_day && s.sched_day === day)
+    if (!here.some(s => GUARD_ROLES.includes(s.role))) push('zone_guard', 'warn', `「${z.name}」全日无保安/安保排班，秩序岗位缺岗`, { zone: z.name })
+    if (!here.some(s => s.role === '保洁')) push('zone_clean', 'warn', `「${z.name}」全日无保洁排班，卫生岗位缺岗`, { zone: z.name })
   }
-  // 设施检修覆盖
-  const orders = db.prepare("SELECT mo.*, r.name ride_name FROM maintenance_orders mo JOIN rides r ON r.id=mo.ride_id WHERE mo.status IN ('queued','processing')").all()
-  for (const o of orders) {
-    if (!list.some(s => s.role === '维修')) {
-      push('maintenance', o.status === 'processing' ? 'block' : 'warn',
-        `检修工单 ${o.code}（${o.ride_name}）${o.status === 'processing' ? ' 检修中' : '排队中'}，当日无维修工当班`, { type: 'ride', id: o.ride_id, name: o.ride_name })
+
+  // 2) 需求画像 → 班段 × 岗位缺口
+  const demand = demandForDay(day)
+  const checks = [
+    { key: 'need_guard', type: 'flow_guard', roles: GUARD_ROLES, roleName: '保安/安保' },
+    { key: 'need_clean', type: 'flow_clean', roles: ['保洁'], roleName: '保洁' },
+    { key: 'need_repair', type: 'maintenance_band', roles: ['维修'], roleName: '维修工' }
+  ]
+  for (const b of demand.bands) {
+    for (const c of checks) {
+      const need = b[c.key]
+      if (!need) continue
+      const have = countByBand(list, day, b.key, r => c.roles.includes(r))
+      if (have >= need) continue
+      const started = bandStarted(b)
+      let level = started ? 'warn' : 'warn'
+      let reason = ''
+      if (c.key === 'need_repair') {
+        const proc = (b.orders || []).some(o => o.status === 'processing')
+        level = started && proc ? 'block' : 'warn'
+        reason = `检修工单 ${(b.orders || []).map(o => o.code).join('、')} 需要 ${c.roleName}`
+      } else {
+        reason = `${b.label}预测客流峰值 ${b.peak} 人`
+      }
+      push(c.type, level, `${b.label}（${b.hours[0]}:00~${b.key === 'evening' ? 18 : b.hours[b.hours.length - 1] + 1}:00）${c.roleName}需求 ${need} 人、在岗 ${have} 人，缺口 ${need - have} 人：${reason}`,
+        { band: b.key, role: c.roleName, need, have, gap: need - have })
+    }
+    // 投诉岗位缺口（按班段挂载的投诉逐条提示，紧急投诉且班段已开始 → block）
+    for (const c of b.complaints) {
+      const roles = c.roles
+      const roleCheck = r => roles.some(x => GUARD_ROLES.includes(x) ? GUARD_ROLES.includes(r) : r === x)
+      const have = countByBand(list, day, b.key, roleCheck)
+      if (have > 0) continue
+      const level = bandStarted(b) && c.severity === 3 ? 'block' : 'warn'
+      push('complaint', level,
+        `${b.label}投诉 ${c.code}（${c.severity === 3 ? '紧急' : c.severity === 2 ? '严重' : '一般'}）需「${roles.join('/')}」岗位，当前缺口 1 人`,
+        { band: b.key, complaint_id: c.id, complaint_code: c.code, severity: c.severity, need: 1, have: 0, gap: 1 })
     }
   }
-  // 投诉岗位覆盖
-  if (ctx.complaintRoles) {
-    const complaints = db.prepare("SELECT * FROM complaints WHERE status IN ('open','processing','ready') LIMIT 30").all()
-    for (const c of complaints) {
-      const roles = ctx.complaintRoles[c.category] || []
-      if (roles.length && !list.some(s => roles.includes(s.role))) {
-        push('complaint', 'warn', `投诉 ${c.code || `#${c.id}`} 需「${roles.join('/')}」岗位，当日无匹配排班`)
+
+  // 3) 在途检修工单兜底（无任何维修工排班 → 沿用旧版强提示）
+  const allOrders = db.prepare("SELECT mo.*, r.name ride_name FROM maintenance_orders mo JOIN rides r ON r.id=mo.ride_id WHERE mo.status IN ('queued','processing')").all()
+  for (const o of allOrders) {
+    const covered = list.some(s => s.role === '维修' && !s.cross_day && s.sched_day === day)
+    if (!covered) {
+      push('maintenance', o.status === 'processing' ? 'block' : 'warn',
+        `检修工单 ${o.code}（${o.ride_name}）${o.status === 'processing' ? '检修中' : '排队中'}，当日无维修工当班`,
+        { order_id: o.id, order_code: o.code, ride_name: o.ride_name })
+    }
+  }
+
+  return { day, warnings, rosterCount: list.length, demand }
+}
+
+// ---------------- 动态调度：按需求缺口自动补位 + 紧急加班调令 ----------------
+// 疲劳规避：前一日上跨日夜班（次日 9 点才下班）的员工，当日日班不再排
+function workedNightBefore(staffId, day) {
+  return !!db.prepare(`
+    SELECT 1 FROM staff_schedules sc
+    JOIN shift_templates sh ON sh.id=sc.shift_id
+    WHERE sc.staff_id=? AND sc.day=? AND sh.cross_day=1 AND sc.${EFFECTIVE}`).get(staffId, day - 1)
+}
+
+// 候选员工：在岗、非运营主管、当日无有效排班、非前夜夜班；按区域匹配与既有排班负载排序
+function dispatchCandidates(day, roles, zoneId = null) {
+  return db.prepare("SELECT * FROM staff WHERE active=1 AND role<>'运营主管' ORDER BY id").all()
+    .filter(st => roles.includes(st.role))
+    .filter(st => !effectiveScheduleOf(st.id, day))
+    .filter(st => !workedNightBefore(st.id, day))
+    .sort((a, b) => {
+      const za = zoneId ? (a.zone_id === zoneId ? 0 : 1) : 0
+      const zb = zoneId ? (b.zone_id === zoneId ? 0 : 1) : 0
+      if (za !== zb) return za - zb
+      const loadA = db.prepare(`SELECT COUNT(*) n FROM staff_schedules WHERE staff_id=? AND day BETWEEN ? AND ? AND ${EFFECTIVE}`).get(a.id, day, day + 2).n
+      const loadB = db.prepare(`SELECT COUNT(*) n FROM staff_schedules WHERE staff_id=? AND day BETWEEN ? AND ? AND ${EFFECTIVE}`).get(b.id, day, day + 2).n
+      return loadA - loadB || b.skill - a.skill
+    })
+}
+
+// 计算某日班段 × 岗位缺口（直接以需求画像为事实源，避免从预警文案反推）
+// 动态调度视角：当天班段进行中时，已排进本班段但尚未打卡的人也计入（引擎到点自动打卡/稍后补打卡）
+export function gapsForDay(day, { forDispatch = true } = {}) {
+  const demand = demandForDay(day)
+  const list = roster(day)
+  const t = ctx.tick()
+  const countRole = (bandKey, roles) => list.filter(s => {
+    if (!roles.includes(s.role)) return false
+    const band = BANDS.find(b => b.key === bandKey)
+    if (s.cross_day) {
+      return day === s.sched_day && (bandKey === 'night' || (bandKey === 'evening' && band.hours.includes(17)))
+    }
+    if (s.sched_day !== day) return false
+    if (band.shift_code !== s.shift_code) return false
+    if (forDispatch && day === ctx.day()) {
+      const curHour = OPEN_HOUR + (t - linear(day, OPEN_HOUR))
+      const inBand = band.hours.some(h => h <= curHour)
+      // 进行中班段：真实在岗 或 已排本班（引擎到点自动打卡）都算动态调度覆盖
+      if (inBand) return !!s.on_duty_now || s.shift_code === band.shift_code
+    }
+    return true
+  }).length
+  const gaps = []
+  const roleChecks = [
+    { role: '保安/安保', needKey: 'need_guard' },
+    { role: '保洁', needKey: 'need_clean' },
+    { role: '维修工', needKey: 'need_repair' }
+  ]
+  for (const b of demand.bands) {
+    for (const c of roleChecks) {
+      const rolesArr = ROLES_BY_NAME[c.role]
+      // 维修工需求含投诉驱动（need_repair 已合并检修工单 + 设施类投诉）；保安/保洁需求已含投诉兜底
+      const need = b[c.needKey]
+      if (!need) continue
+      const have = forDispatch ? countRole(b.key, rolesArr) : countByBand(list, day, b.key, r => rolesArr.includes(r))
+      if (have >= need) continue
+      // 硬需求只认本岗位相关的工单/投诉（维修缺口挂维修工单，保安/保洁缺口不会因为有检修单就变硬）
+      const relatedComplaints = b.complaints.filter(x => rolesArr.some(r => (x.roles || []).includes(r)))
+      const relatedOrders = c.role === '维修工' ? (b.orders || []) : []
+      const hard = relatedOrders.length > 0 || relatedComplaints.length > 0
+      gaps.push({ band: b.key, role: c.role, roles: rolesArr, need, have, gap: need - have, hard,
+        orders: relatedOrders, complaints: relatedComplaints })
+    }
+  }
+  return { demand, gaps }
+}
+
+// 按需求画像为未来 horizon 天（含当天）补齐缺口；返回补位明细。
+// 当天未开始班段：正常补排；已开始班段：硬需求（检修/投诉）允许跨班段临班补排（未开始且时段重叠的邻班，
+// 如中班缺维修工 → 排未开始的晚班，14 点到岗后即可接单）；仍补不上的缺口转为紧急加班调令（主管审批）。
+export function runDynamicDispatch({ horizon = 3, reason = '', urgentOvertime = false } = {}) {
+  const created = []
+  const otRequests = []
+  const today = ctx.day()
+  const t = ctx.tick()
+  const shifts = listShiftTemplates({ activeOnly: true })
+
+  for (let d = today; d <= today + horizon - 1; d++) {
+    // 逐班段 × 岗位缺口补位；每补一个人都会影响候选池与缺口数，故每轮实时重算
+    for (const band of BANDS) {
+      for (let pass = 0; pass < 24; pass++) {
+        // 该班段仍未消解的全部岗位缺口，按硬需求（检修/投诉）优先补
+        const gapsNow = gapsForDay(d).gaps
+          .filter(x => x.band === band.key && x.gap > 0)
+          .sort((a, b2) => Number(b2.hard) - Number(a.hard) || b2.gap - a.gap)
+        if (!gapsNow.length) break
+        const g = gapsNow[0]
+        const sh = shifts.find(x => x.code === band.shift_code)
+        if (!sh) break
+        const curHour = OPEN_HOUR + (t - linear(d, OPEN_HOUR))
+        const bandEndHour = band.hours[band.hours.length - 1] + 1
+        const bandStarted = d === today && curHour >= sh.start_hour
+        const bandLive = d !== today || curHour < bandEndHour
+
+        // 目标班次：班段未开始/进行中 → 本班（进行中用 allowStarted 放进班，引擎随后自动打卡）；
+        // 班段已过的硬需求 → 当日未开始且与缺口时段重叠的最近邻班接续；其余缺口不再补排（转加班调令）
+        let target = null
+        let allowStarted = false
+        let noteSuffix = ''
+        if (!bandStarted || bandLive) {
+          target = sh
+          allowStarted = bandStarted
+        } else if (g.hard) {
+          target = shifts
+            .filter(x => !x.cross_day && x.start_hour > curHour && x.start_hour <= band.hours[band.hours.length - 1])
+            .sort((a, b2) => a.start_hour - b2.start_hour)[0] || null
+          if (target) noteSuffix = `（原${band.label}已过，${target.name}接续补位）`
+        }
+        if (!target) break
+        const cand = dispatchCandidates(d, g.roles)[0]
+        if (!cand) break
+        const rr = createSchedule({
+          staffId: cand.id, shiftId: target.id, day: d, source: 'dispatch',
+          note: reason ? `动态调度：${reason}${noteSuffix}` : `动态调度补${band.label}${g.role}缺口${noteSuffix}`,
+          requestId: `disp-${d}-${target.id}-${cand.id}-${band.key}-${pass}`,
+          allowStarted
+        })
+        if (!rr.ok) break
+        created.push({ id: rr.id, code: rr.code, staff_id: cand.id, staff_name: cand.name, day: d, band: band.key, shift: target.code })
+      }
+    }
+
+    // 班段补排全部尝试后，仍存在的当天已开始班段缺口 → 紧急加班调令（相邻班段在岗员工，主管审批）
+    if (urgentOvertime) {
+      for (const g of gapsForDay(d).gaps) {
+        const sh = shifts.find(x => x.code === BANDS.find(b => b.key === g.band).shift_code)
+        if (!sh) continue
+        if (d !== today || linear(d, sh.start_hour) > t) continue
+        otRequests.push(...createUrgentOvertime(d, g, reason))
       }
     }
   }
-  return { day, warnings, rosterCount: list.length }
+  return { ok: true, created, otRequests, days: horizon }
 }
 
-// ---------------- 引擎：自动排班 / 打卡 / 工时累计 / 下班结算 ----------------
-// 自动为未来两天（含今天）无有效排班的在岗员工补排（运营主管不参与自动排班）
+// 紧急加班调令：班段已开始且补不上人时，给相邻班段在岗、岗位匹配的员工生成系统加班申请（主管审批）
+function createUrgentOvertime(day, gap, reason) {
+  const out = []
+  const t = ctx.tick()
+  // 找当前在岗、岗位匹配、加班不超时段限制、且没有待审批加班申请的员工
+  const onDuty = roster(day).filter(s => s.on_duty_now && !s.cross_day)
+  const roles = ROLES_BY_NAME[gap.role] || ROLES_BY_NAME['维修工']
+  let need = gap.gap
+  for (const s of onDuty) {
+    if (need <= 0) break
+    if (!roles.includes(s.role)) continue
+    const sh = getShift(s.shift_id)
+    if (!sh) continue
+    const att = db.prepare('SELECT * FROM staff_attendance WHERE schedule_id=?').get(s.schedule_id)
+    if (!att || att.status !== 'checked_in') continue
+    // 加班补到当前班段结束（中班缺口补到 17:00、晚班缺口补到闭园 18:00），日班加班上限 4h
+    const curHour = OPEN_HOUR + (t - linear(day, OPEN_HOUR))
+    const bandEnd = gap.band === 'morning' ? 14 : gap.band === 'mid' ? 17 : CLOSE_HOUR
+    const ticks = Math.min(4, Math.max(1, bandEnd - curHour - att.overtime_ticks))
+    if (sh.end_hour + att.overtime_ticks + ticks > CLOSE_HOUR) continue
+    const dup = db.prepare("SELECT id FROM shift_requests WHERE kind='overtime' AND status='pending' AND schedule_id=?").get(s.schedule_id)
+    if (dup) continue
+    const id = Number(db.prepare(`INSERT INTO shift_requests(kind,staff_id,schedule_id,day,ot_ticks,reason,status,source,create_tick,create_day)
+                                 VALUES('overtime',?,?,?,?,?, 'pending','dispatch',?,?)`)
+      .run(s.id, s.schedule_id, day, ticks,
+        `系统紧急调令：${gap.band === 'morning' ? '早' : gap.band === 'mid' ? '中' : '晚'}班${gap.role}缺岗 ${gap.gap} 人${reason ? `（${reason}）` : ''}，请加班补位`,
+        t, day).lastInsertRowid)
+    const code = 'TB' + String(id).padStart(4, '0')
+    db.prepare('UPDATE shift_requests SET code=? WHERE id=?').run(code, id)
+    logShift({
+      scheduleId: s.schedule_id, attendanceId: att.id, requestId: id, action: 'ot_request',
+      note: `动态调度生成紧急加班调令：${s.name}${gap.role}加班 ${ticks}h 补 ${gap.band}班缺口，待主管审批`, staffId: s.id
+    })
+    out.push({ id, code, staff_id: s.id, ticks })
+    need--
+  }
+  return out
+}
+
+// 操作联动钩子：调班批准/取消/解雇/报修/投诉建单后触发（受自动补位总开关与动态模式约束）
+export function maybeDispatchAfter(reason = '岗位需求变化') {
+  if (!num(getSetting('scheduleAutoFill'), 1)) return { ok: true, skipped: true }
+  if (getSetting('scheduleMode', 'dynamic') !== 'dynamic') return { ok: true, skipped: true }
+  try {
+    return runDynamicDispatch({ reason })
+  } catch (e) {
+    console.error('[scheduling] 联动动态调度失败（不影响主操作）:', e)
+    return { ok: false, msg: '动态调度失败' }
+  }
+}
+
+// ---------------- 引擎：自动补位 / 打卡 / 工时累计 / 下班结算 ----------------
+// 基础模式：为未来 horizon-1 天无有效排班的在岗员工按轮换补排日班（兼容旧玩法）
 function autoFillSchedules() {
   if (!num(getSetting('scheduleAutoFill'), 1)) return
   if (!db.prepare('SELECT COUNT(*) n FROM shift_templates WHERE active=1').get().n) return
+  if (getSetting('scheduleMode', 'dynamic') === 'dynamic') {
+    // 动态模式：按预约客流 / 检修工单 / 投诉岗位需求补缺口（含当天紧急加班调令）
+    runDynamicDispatch({ horizon: 3, urgentOvertime: true, reason: '引擎每小时需求巡检' })
+    return
+  }
   const dayShifts = listShiftTemplates({ activeOnly: true }).filter(s => !s.cross_day)
   if (!dayShifts.length) return
   const today = ctx.day()
@@ -561,6 +975,7 @@ function autoFillSchedules() {
     const staff = db.prepare("SELECT * FROM staff WHERE active=1 AND role<>'运营主管' ORDER BY id").all()
     for (const st of staff) {
       if (effectiveScheduleOf(st.id, d)) continue
+      if (workedNightBefore(st.id, d)) continue
       const sh = dayShifts[Math.abs(st.id * 7 + d * 3) % dayShifts.length]
       // 当天只补排尚未开始的班次
       if (d === today && linear(d, sh.start_hour) <= ctx.tick()) continue
@@ -657,7 +1072,7 @@ function enrichSchedule(sch) {
   const att = attendanceBySchedule(sch.id)
   const bounds = sh ? shiftBounds(sch, sh) : { begin: 0, end: 0 }
   const t = ctx.tick()
-  return {
+  const x = {
     ...sch,
     staff_name: st?.name || '',
     staff_role: st?.role || '',
@@ -682,8 +1097,18 @@ function enrichSchedule(sch) {
     pay: att?.pay || 0,
     satisfaction_delta: att?.satisfaction_delta || 0,
     attendance_id: att?.id || null,
-    on_duty: att?.status === 'checked_in' && t >= bounds.begin && t < bounds.end + (att.overtime_ticks || 0)
+    on_duty: att?.status === 'checked_in' && t >= bounds.begin && t < bounds.end + (att.overtime_ticks || 0),
+    night_phase: ''
   }
+  // 跨日夜班在看板上的实时阶段：upcoming 未到岗 / night_on 当夜值守 / morning_after 次日凌晨值守 / done 已下班
+  if (sh?.cross_day) {
+    const nightStart = linear(sch.day, sh.start_hour)
+    if (t < nightStart) x.night_phase = 'upcoming'
+    else if (t < linear(sch.day, CLOSE_HOUR)) x.night_phase = 'night_on'
+    else if (t < bounds.end || (att?.status === 'checked_in' && t < bounds.end + (att.overtime_ticks || 0))) x.night_phase = 'morning_after'
+    else x.night_phase = 'done'
+  }
+  return x
 }
 
 export function listSchedules({ day = null, from = null, to = null, staffId = null, status = null, limit = 500 } = {}) {
@@ -765,6 +1190,12 @@ export function schedulingStats() {
   const ot = db.prepare('SELECT COALESCE(SUM(overtime_ticks),0) n FROM staff_attendance WHERE day=? AND ot_approved=1').get(day).n
   const payRow = db.prepare("SELECT COUNT(*) n, COALESCE(SUM(pay),0) p FROM staff_attendance WHERE settle_day=? AND status IN ('checked_out','leave')").get(day)
   const pending = db.prepare("SELECT COUNT(*) n FROM shift_requests WHERE status='pending'").get().n
+  const dispatchOt = db.prepare("SELECT COUNT(*) n FROM shift_requests WHERE status='pending' AND source='dispatch'").get().n
+  const dispatchToday = db.prepare(`SELECT COUNT(*) n FROM staff_schedules WHERE create_day=? AND source='dispatch'`).get(day).n
+  // 跨日夜班：前一日 17 点上班、当前仍在岗（次日凌晨值守）的人数（次日 9:00 即自动结算）
+  const nightOn = db.prepare(`SELECT COUNT(*) n FROM staff_attendance a
+    JOIN shift_templates sh ON sh.id=a.shift_id
+    WHERE a.status='checked_in' AND sh.cross_day=1 AND a.day=?`).get(day - 1).n
   const coverage = coverageForDay(day)
   return {
     day,
@@ -776,7 +1207,32 @@ export function schedulingStats() {
     settledToday: payRow.n,
     payToday: payRow.p,
     pendingRequests: pending,
+    dispatchOtRequests: dispatchOt,
+    dispatchFilledToday: dispatchToday,
+    nightOnDuty: nightOn,
+    flowToday: coverage.demand.flowTotal,
     coverageWarnings: coverage.warnings.length,
     coverageBlocks: coverage.warnings.filter(w => w.level === 'block').length
+  }
+}
+
+// 未来 horizon 天动态调度计划（只读）：需求画像 + 当前覆盖缺口，供前端「动态调度」页展示
+export function dispatchPlan({ horizon = 3 } = {}) {
+  const today = ctx.day()
+  const days = []
+  for (let d = today; d <= today + horizon - 1; d++) {
+    const cov = coverageForDay(d)
+    days.push({ day: d, demand: cov.demand, warnings: cov.warnings, rosterCount: cov.rosterCount })
+  }
+  return {
+    today,
+    mode: getSetting('scheduleMode', 'dynamic'),
+    autoFill: num(getSetting('scheduleAutoFill'), 1) ? 1 : 0,
+    params: {
+      guardFlow: num(getSetting('dispatchGuardFlow'), 500),
+      cleanFlow: num(getSetting('dispatchCleanFlow'), 700),
+      nightGuardsPerZone: num(getSetting('dispatchNightGuardsPerZone'), 0)
+    },
+    days
   }
 }

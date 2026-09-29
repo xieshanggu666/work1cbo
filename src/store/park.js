@@ -42,7 +42,8 @@ function emptySchedulingStats() {
   return {
     day: 1, todayScheduled: 0, onDuty: 0, absentToday: 0, lateToday: 0,
     overtimeHoursToday: 0, settledToday: 0, payToday: 0, pendingRequests: 0,
-    coverageWarnings: 0, coverageBlocks: 0
+    coverageWarnings: 0, coverageBlocks: 0,
+    dispatchOtRequests: 0, dispatchFilledToday: 0, nightOnDuty: 0, flowToday: 0
   }
 }
 
@@ -90,6 +91,7 @@ export const useParkStore = defineStore('park', {
     shiftRequests: s => s.data?.shiftRequests || [],
     schedulingStats: s => s.data?.schedulingStats || emptySchedulingStats(),
     coverageToday: s => s.data?.coverageToday || { warnings: [], rosterCount: 0 },
+    dispatchPlanData: s => s.data?.dispatchPlan || { days: [], params: {}, mode: 'dynamic' },
     supervisors: s => (s.data?.staff || []).filter(x => x.role === '运营主管')
   },
   actions: {
@@ -161,6 +163,9 @@ export const useParkStore = defineStore('park', {
     rejectShiftRequest(id, approver_id, note) { return this.api('POST', `/shift-requests/${id}/reject`, { approver_id, note }) },
     cancelShiftRequest(id, staff_id) { return this.api('POST', `/shift-requests/${id}/cancel`, { staff_id }) },
     saveScheduleConfig(payload) { return this.api('POST', '/schedule-config', payload) },
+    runDispatch(payload) { return this.api('POST', '/dispatch/run', payload || {}) },
+    async coverageOf(day) { return j('GET', `/coverage/${day}`) },
+    async dispatchPlanFetch() { return j('GET', '/dispatch-plan') },
     async scheduleLogs(payload) {
       const q = new URLSearchParams(Object.entries(payload).filter(([, v]) => v != null && v !== '').map(([k, v]) => [k, v])).toString()
       return j('GET', `/schedules/logs?${q}`)

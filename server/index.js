@@ -28,7 +28,7 @@ import {
   requestOvertime, approveOvertime, rejectOvertime, cancelRequest,
   listSchedules, listAttendance, listRequests as listShiftRequests,
   shiftLogs, schedulingStats, coverageForDay, staffDutyState, writeWorkCompletion,
-  listShiftTemplates
+  listShiftTemplates, demandForDay, dispatchPlan, runDynamicDispatch, maybeDispatchAfter
 } from './scheduling.js'
 
 const app = express()
@@ -245,6 +245,8 @@ function createComplaint({ category, severity, title, content, target, source, m
   const code = 'TS' + String(id).padStart(4, '0')
   db.prepare('UPDATE complaints SET code=? WHERE id=?').run(code, id)
   logComplaint(id, 'submit', source === 'manual' ? '前台登记游客反馈' : '游客通过客服热线提交投诉')
+  // 动态调度联动：新增投诉产生岗位需求，自动为未来班段补齐匹配排班（紧急缺口转加班调令待审批）
+  try { maybeDispatchAfter(`新投诉${code}岗位需求`) } catch { /* 调度失败不阻塞建单 */ }
   return { id, code }
 }
 
@@ -846,6 +848,7 @@ app.get('/api/state', (req, res) => {
     ),
     schedulingStats: schedulingStats(),
     coverageToday: coverageForDay(state.day()),
+    dispatchPlan: dispatchPlan({ horizon: 3 }),
     finance: fin,
     avgs: {
       satisfaction: computeSatisfaction(),
@@ -898,6 +901,7 @@ app.post('/api/rides/:id', (req, res) => {
     if (!ride) return res.status(404).json({ ok: false, msg: '设施不存在' })
     const r = createMaintenanceOrder(id, 'manual')
     if (!r.ok) return res.status(400).json(r)
+    maybeDispatchAfter(`检修工单${r.code}维修工需求`)
     return res.json(r)
   }
 
@@ -1012,6 +1016,8 @@ app.post('/api/staff/:id', (req, res) => {
       releaseStaffOrders(id)
       // 排班联动：未来排班取消、待审批调班作废、在岗考勤立即按实际工时离岗结算
       releaseStaffSchedules(id)
+      // 动态调度联动：离岗腾出的岗位缺口自动补位（紧急缺口转加班调令待审批）
+      maybeDispatchAfter('员工离岗后岗位缺口补齐')
     }
   }
   if (b.assignRide) db.prepare('UPDATE staff SET assigned_ride_id=? WHERE id=?').run(num(b.assignRide), id)
@@ -1221,6 +1227,7 @@ app.get('/api/maintenance/:id', (req, res) => {
 // 接单 / 转派（仅在岗维修员工，每人同时只接一个在修工单）
 app.post('/api/maintenance/:id/assign', (req, res) => {
   const r = assignMaintenanceOrder(num(req.params.id), num(req.body?.staff_id))
+  if (r.ok) maybeDispatchAfter('检修工单派工后维修工需求平衡')
   res.status(r.ok ? 200 : 400).json(r)
 })
 
@@ -1358,18 +1365,48 @@ app.post('/api/shift-requests/:id/cancel', (req, res) => {
   res.status(r.ok ? 200 : 400).json({ ...r, reqId: req.reqId })
 })
 
-// 排班运营配置：自动排班开关 / 加班倍率
+// 排班运营配置：自动补位开关 / 调度模式（auto 全员基础补位 / dynamic 需求动态调度）/ 加班倍率 / 客流承载参数
 app.post('/api/schedule-config', (req, res) => {
   const b = req.body || {}
   if (b.auto_fill !== undefined) setSetting('scheduleAutoFill', b.auto_fill ? 1 : 0)
+  if (b.mode !== undefined) setSetting('scheduleMode', b.mode === 'auto' ? 'auto' : 'dynamic')
   if (b.ot_rate_mul !== undefined) {
     const v = Math.max(1, Math.min(3, num(b.ot_rate_mul, 1.5)))
     setSetting('otRateMul', v)
   }
+  if (b.guard_flow !== undefined) setSetting('dispatchGuardFlow', Math.max(100, Math.min(5000, num(b.guard_flow, 500))))
+  if (b.clean_flow !== undefined) setSetting('dispatchCleanFlow', Math.max(100, Math.min(5000, num(b.clean_flow, 700))))
+  if (b.night_guards_per_zone !== undefined) setSetting('dispatchNightGuardsPerZone', Math.max(0, Math.min(10, num(b.night_guards_per_zone, 0))))
   res.json({ ok: true, config: {
     autoFill: num(getSetting('scheduleAutoFill'), 1) ? 1 : 0,
-    otRateMul: num(getSetting('otRateMul'), 1.5)
+    mode: getSetting('scheduleMode', 'dynamic'),
+    otRateMul: num(getSetting('otRateMul'), 1.5),
+    guardFlow: num(getSetting('dispatchGuardFlow'), 500),
+    cleanFlow: num(getSetting('dispatchCleanFlow'), 700),
+    nightGuardsPerZone: num(getSetting('dispatchNightGuardsPerZone'), 0)
   } })
+})
+
+// 动态调度计划（只读）：未来 3 天需求画像（预约客流/检修工单/投诉岗位）与覆盖缺口
+app.get('/api/dispatch-plan', (req, res) => {
+  res.json({ plan: dispatchPlan({ horizon: 3 }) })
+})
+
+// 手动触发一次动态补位：按需求缺口自动排班；当天已开始班段的缺口转紧急加班调令（走主管审批）
+app.post('/api/dispatch/run', (req, res) => {
+  const b = req.body || {}
+  const r = runDynamicDispatch({
+    horizon: 3,
+    urgentOvertime: b.urgent_overtime !== false,
+    reason: String(b.reason || '主管手动触发动态调度')
+  })
+  res.json({ ...r, reqId: req.reqId, plan: dispatchPlan({ horizon: 3 }) })
+})
+
+// 单日需求画像（覆盖预警页按日查看）
+app.get('/api/coverage/:day', (req, res) => {
+  const day = num(req.params.day, state.day())
+  res.json({ coverage: coverageForDay(day), demand: demandForDay(day) })
 })
 
 // ---- 分时预约：库存 / 下单 / 改签 / 取消 / 核销 ----

@@ -339,3 +339,148 @@ test('日结汇总：旷工/结算人数与工资合计正确', () => {
   assert.ok(typeof s.absent === 'number')
   assert.ok(s.totalPay >= 0)
 })
+
+// ---------------- 动态调度：预约客流 / 检修工单 / 投诉岗位需求驱动 ----------------
+test('需求画像：输出早/中/晚/夜四班段客流与岗位需求结构', () => {
+  const d = SCH.demandForDay(50)
+  assert.equal(d.bands.length, 4)
+  const morning = d.bands.find(b => b.key === 'morning')
+  assert.ok(morning.flow >= 0)
+  assert.ok(morning.need_guard >= 1, '有开放区域时早班至少需要 1 名保安')
+  assert.ok(morning.need_clean >= 1, '有开放区域时早班至少需要 1 名保洁')
+  assert.equal(morning.need_repair, 0)
+  const night = d.bands.find(b => b.key === 'night')
+  assert.equal(night.need_clean, 0)
+  assert.equal(night.need_repair, 0)
+})
+
+test('动态补位：按客流需求把无排班员工排进缺岗班段，排班来源标记为 dispatch', () => {
+  setClock(40, 9)
+  setSetting('scheduleAutoFill', 1)
+  setSetting('scheduleMode', 'dynamic')
+  const day = 41
+  // 高客流阈值 → 至少需要多名保安/保洁，初始无任何排班
+  setSetting('dispatchGuardFlow', 200)
+  setSetting('dispatchCleanFlow', 200)
+  const before = db.prepare("SELECT COUNT(*) n FROM staff_schedules WHERE day=? AND status<>'cancelled'").get(day).n
+  assert.equal(before, 0)
+  const r = SCH.runDynamicDispatch({ horizon: 3, reason: '测试客流高峰补位' })
+  assert.ok(r.ok)
+  assert.ok(r.created.length > 0, '应按缺口生成补位排班')
+  const filled = db.prepare("SELECT * FROM staff_schedules WHERE day=? AND status<>'cancelled'").all(day)
+  assert.ok(filled.every(s => s.source === 'dispatch'), '动态补位排班来源应为 dispatch')
+  // 同一员工同日只有一个有效排班（唯一索引 + 选人过滤双重保证）
+  const dup = db.prepare('SELECT staff_id, COUNT(*) n FROM staff_schedules WHERE day=? AND status<>\'cancelled\' GROUP BY staff_id HAVING n>1').all(day)
+  assert.equal(dup.length, 0)
+  // 补位后覆盖预警应显著收敛（需求人数仍可能超过在册员工，但不得再给已有足够在岗的岗位报缺口）
+  const cov = SCH.coverageForDay(day)
+  const guardWarn = cov.warnings.filter(w => w.type === 'flow_guard' && w.band === 'morning')
+  if (guardWarn.length) assert.ok(guardWarn[0].gap > 0)
+})
+
+test('疲劳规避：前一日上跨日夜班的员工，次日动态补位不再排日班', () => {
+  setClock(42, 9)
+  // 增聘一名专用保安，避免与前序用例的排班互相干扰
+  const gid = Number(db.prepare("INSERT INTO staff(name,role,zone_id,wage,skill,morale,active) VALUES('疲劳测试保安','保安',1,320,1,80,1)").run().lastInsertRowid)
+  const guard = db.prepare('SELECT * FROM staff WHERE id=?').get(gid)
+  const night = shiftByCode('night')
+  // 第 42 天夜班（17:00 上班，次日 9:00 下班）
+  assert.equal(SCH.createSchedule({ staffId: guard.id, shiftId: night.id, day: 42, requestId: 'fatigue-1' }).ok, true)
+  setClock(43, 9)
+  setSetting('scheduleMode', 'dynamic')
+  SCH.runDynamicDispatch({ horizon: 3 })
+  // 第 43 天动态补位不应给该保安再排日班（其前夜夜班今早 9 点才下班）
+  const day43 = db.prepare("SELECT * FROM staff_schedules WHERE staff_id=? AND day=43 AND status<>'cancelled'").all(guard.id)
+  assert.equal(day43.length, 0, '夜班次日凌晨才下班，当日不应再被动态补位')
+})
+
+test('检修工单需求：动态调度自动排维修工；在修工单无维修工当班时为 block 预警', () => {
+  setClock(44, 9)
+  setSetting('scheduleMode', 'dynamic')
+  const ride = db.prepare("SELECT * FROM rides ORDER BY id LIMIT 1").get()
+  // 直接构造一个排队检修工单
+  const oid = Number(db.prepare(`INSERT INTO maintenance_orders(code,ride_id,status,source,progress,cost,create_tick,create_day)
+                                VALUES('WXT001',?,'queued','manual',0,3000,?,44)`)
+    .run(ride.id, Number(getSetting('tick'))).lastInsertRowid)
+  SCH.runDynamicDispatch({ horizon: 3, reason: '测试检修需求' })
+  const repairs = db.prepare(`
+    SELECT sc.* FROM staff_schedules sc
+    JOIN staff s ON s.id=sc.staff_id
+    WHERE sc.day=44 AND sc.status<>'cancelled' AND s.role='维修'`).all()
+  assert.ok(repairs.length > 0, '排队检修工单应驱动维修工排班')
+  // 无维修工的日子：block 级预警
+  db.prepare("UPDATE staff_schedules SET status='cancelled' WHERE day=44 AND staff_id IN (SELECT id FROM staff WHERE role='维修')").run()
+  db.prepare("UPDATE maintenance_orders SET status='processing' WHERE id=?").run(oid)
+  const cov = SCH.coverageForDay(44)
+  assert.ok(cov.warnings.some(w => w.type === 'maintenance_band' && w.level === 'block' || w.type === 'maintenance' && w.level === 'block'),
+    '检修中且无维修工当班应为 block 级预警')
+})
+
+test('投诉岗位需求：紧急设施投诉驱动维修工排班，且按岗位匹配不会错派保安', () => {
+  setClock(45, 9)
+  setSetting('scheduleMode', 'dynamic')
+  // 第 45 天先清空所有有效排班（隔离断言）
+  db.prepare("UPDATE staff_schedules SET status='cancelled' WHERE day=45").run()
+  db.prepare(`INSERT INTO complaints(code,tick,day,category,severity,title,status,deadline_tick,source)
+              VALUES('TST0999',?,45,'facility',3,'测试紧急设施投诉','open',?+10,'manual')`)
+    .run(Number(getSetting('tick')), Number(getSetting('tick')))
+  SCH.runDynamicDispatch({ horizon: 3, reason: '测试紧急投诉' })
+  const band = SCH.demandForDay(45).bands.find(b => b.complaints.some(c => c.code === 'TST0999'))
+  assert.ok(band, '紧急投诉应挂入早班岗位需求')
+  const repairScheduled = db.prepare(`
+    SELECT COUNT(*) n FROM staff_schedules sc JOIN staff s ON s.id=sc.staff_id
+    WHERE sc.day=45 AND sc.status<>'cancelled' AND s.role='维修'`).get().n
+  assert.ok(repairScheduled >= 1, '紧急设施投诉应驱动至少 1 名维修工排班')
+})
+
+test('紧急加班调令：当天已开始班段缺岗且有相邻班段在岗匹配员工时，生成 dispatch 来源的待审批加班申请', () => {
+  // 前一日闭园时预排次日早班保安（9:00 当刻会被视为班次已开始，故提前排）
+  setClock(45, 18)
+  setSetting('scheduleMode', 'dynamic')
+  // 增聘一名专用早班保安 + 若干占用晚班的保安，避免与前序用例互相干扰
+  const hireGuard = () => db.prepare('SELECT * FROM staff WHERE id=?').get(
+    Number(db.prepare("INSERT INTO staff(name,role,zone_id,wage,skill,morale,active) VALUES('调令测试保安','保安',1,320,1,80,1)").run().lastInsertRowid))
+  const guard = hireGuard()
+  const morning = shiftByCode('morning')
+  const sc = SCH.createSchedule({ staffId: guard.id, shiftId: morning.id, day: 46, requestId: 'ot-disp-1' })
+  assert.ok(sc.ok)
+  setClock(46, 13)
+  SCH.processScheduling()   // 13 点自动打卡
+  assert.equal(attOf(sc.id)?.status, 'checked_in')
+  // 制造中班保安高需求（把阈值压低），其他保安用晚班占住使其无法再补中班
+  setSetting('dispatchGuardFlow', 100)
+  for (let i = 0; i < 4; i++) {
+    const g2 = hireGuard()
+    SCH.createSchedule({ staffId: g2.id, shiftId: shiftByCode('evening').id, day: 46, requestId: `ot-disp-g${i}` })
+  }
+  const before = db.prepare("SELECT COUNT(*) n FROM shift_requests WHERE source='dispatch' AND status='pending'").get().n
+  const r = SCH.runDynamicDispatch({ horizon: 1, urgentOvertime: true, reason: '测试紧急调令' })
+  assert.ok(r.otRequests.length >= 1, '中班缺口应至少生成 1 条紧急加班调令')
+  const after = db.prepare("SELECT COUNT(*) n FROM shift_requests WHERE source='dispatch' AND status='pending'").get().n
+  assert.ok(after >= before + 1)
+  // 本次生成的调令：加班类型、挂在当前在岗的匹配岗位员工（含本测试保安）、时长 1~4h
+  const newReqs = db.prepare(`SELECT * FROM shift_requests WHERE id IN (${r.otRequests.map(x => x.id).join(',')})`).all()
+  for (const q of newReqs) {
+    assert.equal(q.kind, 'overtime')
+    assert.equal(q.source, 'dispatch')
+    assert.ok(q.ot_ticks >= 1 && q.ot_ticks <= 4)
+    const onDutyNow = SCH.staffDutyState(q.staff_id)
+    assert.ok(onDutyNow.onDuty, '调令对象必须当前在岗')
+  }
+  // 主管批准调令 → 写入考勤加班、下班点顺延，沿用既有加班审批闭环
+  const ap = SCH.approveOvertime(newReqs[0].id, null)
+  assert.equal(ap.ok, true)
+  const attRow = db.prepare('SELECT * FROM staff_attendance WHERE schedule_id=?').get(newReqs[0].schedule_id)
+  assert.equal(attRow.ot_approved, 1)
+  assert.ok(attRow.overtime_ticks >= 1)
+})
+
+test('调度计划只读接口结构：含模式、参数与未来三天画像', () => {
+  setClock(47, 9)
+  const p = SCH.dispatchPlan({ horizon: 3 })
+  assert.equal(p.days.length, 3)
+  assert.ok(['dynamic', 'auto'].includes(p.mode))
+  assert.ok(p.params.guardFlow > 0)
+  assert.equal(p.days[0].day, 47)
+  assert.ok(Array.isArray(p.days[0].warnings))
+})
